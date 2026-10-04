@@ -75,6 +75,19 @@ OpenCode (`~/.config/opencode/opencode.json`) example:
 }
 ```
 
+PI Agent example:
+
+```json
+  "opencode-zen": {
+      "baseUrl": "http://127.0.0.1:8791/v1",
+      "api": "openai-completions",
+      "apiKey": "public",
+      "models": [
+        { "id": "big-pickle" }
+      ]
+    }
+```
+
 ## Endpoints
 
 - `GET /v1/models` — OpenAI-style model list
