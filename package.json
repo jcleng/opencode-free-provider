@@ -1,0 +1,28 @@
+{
+  "name": "opencode-free-provider",
+  "version": "1.0.0",
+  "description": "Local OpenAI-compatible proxy for OpenCode Zen free models. Lets any agent (OpenCode, etc.) use OpenCode Zen's free tier via a standard /v1 OpenAI completions API at http://127.0.0.1:8791/v1.",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "opencode-free-provider": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-zen",
+    "free",
+    "proxy",
+    "openai",
+    "completions",
+    "llm"
+  ]
+}
