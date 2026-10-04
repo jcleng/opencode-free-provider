@@ -282,14 +282,23 @@ async function* completionToChunks(completion) {
       }])
     }
   }
-  // 4) finish reason + usage
-  yield makeChunk(id, created, modelName, [], completion.choices?.[0]?.finish_reason || (msg.tool_calls?.length ? 'tool_calls' : 'stop'), completion.usage)
+  // 4) terminal chunk: carries the finish_reason (and usage). This MUST contain
+  //    a choice with a non-null finish_reason, otherwise OpenAI-compatible
+  //    clients abort with "Stream ended without finish_reason".
+  const finish = completion.choices?.[0]?.finish_reason || (msg.tool_calls?.length ? 'tool_calls' : 'stop')
+  yield makeChunk(id, created, modelName, [{ delta: {}, finish_reason: finish }], finish, completion.usage)
 }
 
 function makeChunk(id, created, model, choices, finishReason, usage) {
+  // Each choice carries its own finish_reason (explicitly set, even if null for
+  // non-terminal chunks). The overall `finishReason` is the fallback only used
+  // by callers that omit it on a choice.
   return {
     id, object: 'chat.completion.chunk', created, model,
-    choices: choices.map((c) => ({ index: 0, ...c, finish_reason: c.finish_reason ?? finishReason ?? null })),
+    choices: choices.map((c) => ({
+      index: 0, ...c,
+      finish_reason: c.finish_reason === undefined ? (finishReason ?? null) : c.finish_reason,
+    })),
     ...usage ? { usage: mapUsageForChunk(usage) } : {},
   }
 }
