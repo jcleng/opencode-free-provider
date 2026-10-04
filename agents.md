@@ -95,6 +95,13 @@ Concretely:
 
 > The server-side implementations are dependency-free Node builtins: `bash` via `node:child_process` (`sh -c`), `glob`/`grep` via `node:fs` (recursive `.gitignore`-unaware walk), `read` via `node:fs/promises`. They run with `cwd` = the proxy's working directory (or `opts.cwd`).
 
+4. **The streaming SSE we emit MUST end on a chunk with a non-null `finish_reason`.** Because the proxy buffers upstream SSE and replays a synthesized OpenAI stream (`completionToChunks` in `src/upstream.js`), it is responsible for emitting the terminal chunk itself. The original implementation emitted a final chunk with `choices: []` (empty) and stashed the `finish_reason` in a fallback parameter that was shadowed by the explicit per-choice `null` — so OpenAI-compatible clients aborted with **`Stream ended without finish_reason`**. The fix: the terminal chunk always carries `choices:[{ delta:{}, finish_reason: 'stop' | 'tool_calls' }]` plus the `usage` block, and `makeChunk` only falls back to the overall finish reason when a choice omitted it (an explicit `null` is preserved as-is for non-terminal chunks).
+
+> If an agent reports `Stream ended without finish_reason`, the cause is the proxy's synthesized SSE, not upstream. Check `completionToChunks`/`makeChunk` in `src/upstream.js`: the last yielded chunk must contain a choice with a concrete `finish_reason` (never an empty `choices` array). Also note that server-side tool execution (invariant #3) adds latency — each fingerprint tool call is an extra sequential upstream round-trip before the agent sees the final answer — so a tool-using turn legitimately takes longer to load. That latency is expected, not a stall.
+
+### Trade-off: latency vs. robustness (server-side execution)
+Running all four fingerprint tools server-side (invariant #3) is the most robust option because the agent can never be handed an unresolvable tool name. The cost is extra upstream round-trips per tool-using turn. If latency becomes a problem for a client that DOES register its own `bash`/`grep`/`read` (e.g. pi-agent), a lighter variant is to forward those to the agent and intercept only `glob` — but keep the invariant that the agent never receives a fingerprint-named tool it cannot run, otherwise `Tool not found` returns.
+
 ### Where to re-verify the gate
 `https://github.com/Fly143/OpenCode-Zen-free-api` `zen_check.py` is the canonical
 probe (it runs `ablate`/`host`/`relay` checks). Re-run it (or the live checks in
