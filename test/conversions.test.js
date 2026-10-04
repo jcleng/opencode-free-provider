@@ -59,7 +59,7 @@ test('serializeTools maps to openai functions', () => {
   assert.equal(serializeTools([]), undefined)
 })
 
-test('buildRequestBody forces stream:true and always includes the four fingerprint tools', () => {
+test('buildRequestBody forces stream:true and includes the four fingerprint names', () => {
   // Even when the agent asks for non-streaming, upstream must receive stream:true.
   const b = buildRequestBody({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }], stream: false })
   assert.equal(b.model, 'big-pickle')
@@ -67,7 +67,9 @@ test('buildRequestBody forces stream:true and always includes the four fingerpri
   assert.equal(b.stream_options.include_usage, true)
   assert.equal(b.top_p, 0.95)
   const names = b.tools.map((t) => t.function.name).sort()
-  assert.deepEqual(names, ['bash', 'glob', 'grep', 'read'], 'mandatory fingerprint tools always present')
+  // The four mandatory names must be present, but must NOT be duplicated if the
+  // agent already supplied them (duplicate names -> upstream 403 -> 'Tool not found').
+  assert.deepEqual(names, ['bash', 'glob', 'grep', 'read'], 'mandatory fingerprint names present exactly once')
   assert.equal(b.tool_choice, 'auto')
 })
 
@@ -77,6 +79,29 @@ test('mergeTools keeps caller tools and appends the missing fingerprint tools', 
   const names = out.map((t) => t.function.name).sort()
   assert.deepEqual(names, ['bash', 'glob', 'grep', 'read'])
   assert.equal(out.length, 4)
+})
+
+// Regression test for the "Tool not found" failure: OpenCode sends its OWN
+// bash/glob/grep/read tools (with real schemas: command/path/pattern). The
+// fingerprint tools must NOT be appended again, otherwise the upstream free
+// tier rejects the request (403 FreeTierError) because of duplicate names, and
+// the corrupted tool namespace made the model emit tool_calls the agent could
+// not resolve. The caller's real tools must be preserved verbatim.
+test('mergeTools never duplicates OpenCode built-in tool names', () => {
+  const opencodeTools = [
+    { type: 'function', function: { name: 'bash', description: 'bash', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    { type: 'function', function: { name: 'glob', description: 'glob', parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } } },
+    { type: 'function', function: { name: 'grep', description: 'grep', parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } } },
+    { type: 'function', function: { name: 'read', description: 'read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  ]
+  const out = mergeTools(opencodeTools)
+  // Exactly 4 tools, no duplicates, caller schemas preserved.
+  assert.equal(out.length, 4)
+  const names = out.map((t) => t.function.name)
+  assert.deepEqual([...new Set(names)].sort(), ['bash', 'glob', 'grep', 'read'])
+  const bash = out.find((t) => t.function.name === 'bash')
+  assert.equal(bash.function.parameters.properties.command !== undefined, true, 'caller bash schema preserved')
+  assert.equal(bash.function.parameters.properties.p, undefined, 'fingerprint p-param NOT injected over caller tool')
 })
 
 test('mergeTools dedupes by name', () => {

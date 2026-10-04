@@ -214,19 +214,33 @@ export function buildRequestBody({ model, messages, system, tools, maxTokens, te
   }
 }
 
-// Combine any caller-supplied tools with the four mandatory fingerprint tools.
-// The caller's own tools (prompted by the agent) are kept; the fingerprint
-// tools are appended if not already present. Order does not matter upstream.
+// Combine any caller-supplied tools with the mandatory fingerprint tools.
+//
+// CRITICAL: the upstream free-tier gateway requires the tool NAMES
+// `bash` / `glob` / `grep` / `read` to be present in the `tools` array, but it
+// REJECTS the request (HTTP 403 FreeTierError) if ANY tool name appears more
+// than once. OpenCode's built-in tools are already named bash/glob/grep/read,
+// so naively appending the fingerprint tools created duplicate names -> 403,
+// and a corrupted tool namespace that made the model emit `tool_call`s the
+// agent could not resolve (surfaced by OpenCode as "Tool not found").
+//
+// Fix: keep the caller's own tools verbatim, and inject each required name
+// ONLY when it is missing. Exact names are preserved so the gate stays happy
+// and there are never duplicates.
 export function mergeTools(tools) {
   const out = []
   const names = new Set()
   const add = (t) => {
     const name = t?.function?.name
-    if (name && names.has(name)) return
-    if (name) names.add(name)
+    if (!name || names.has(name)) return
+    names.add(name)
     out.push(t)
   }
+  // 1) Preserve the caller's own tools (these are what the agent can actually
+  //    execute — e.g. OpenCode's real bash/glob/grep/read with param command/path).
   for (const t of tools || []) add(t)
+  // 2) Inject each mandatory fingerprint name ONLY if the caller did not already
+  //    provide one with that exact name. This guarantees no duplicate names.
   for (const t of ZEN_FREE_TOOLS) add(t)
   return out
 }

@@ -105,11 +105,18 @@ must be verified live against the free tier before being added back.
 ## Test
 
 ```bash
-npm test             # 23 unit tests (mock upstream)
+npm test             # 24 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the
 fingerprint described above.
+
+> **Tool calls / `Tool not found`:** the upstream free tier requires the four tool
+> names `bash`/`glob`/`grep`/`read` in the body, but a **duplicate name** triggers
+> `403`. The proxy (`mergeTools` in `src/conversions.js`) keeps the agent's own
+> tools and injects each required name only when missing, so OpenCode's real
+> `bash`/`glob`/`grep`/`read` (with their `command`/`path`/`pattern` schemas) are
+> preserved — the model emits tool calls the agent can actually execute.
 
 ## License
 

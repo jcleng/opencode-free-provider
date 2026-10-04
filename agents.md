@@ -31,7 +31,7 @@ their `zen_check.py` `ablate` test):
 | `User-Agent` | `opencode/1.18+` (lowercase, version ≥ 1.18; older → `426`, non-opencode → `403`) |
 | `x-opencode-session` | `ses_` + 12 hex + 14 hex chars (UUID format → `403`) |
 | body `stream` | **must be `true`** (false → `403`) |
-| body `tools` | must contain **all four** `bash`/`glob`/`grep`/`read` (missing any → `403`) |
+| body `tools` | must contain **all four** `bash`/`glob`/`grep`/`read` **(exactly once each; a duplicate name → `403`)** (missing any → `403`) |
 | `Authorization` | `Bearer public` (not validated server-side, but sent for parity) |
 
 This proxy injects every required header/field, so plain OpenAI clients just work.
@@ -69,6 +69,26 @@ Concretely:
   shape in `src/conversions.js` (translate/`shapeCompletion`) for a fingerprint
   change — those are the stable downstream contract.
 
+### The `tools` array has TWO hard invariants (both cause failures)
+
+1. **All four names present, no duplicates.** `mergeTools()` keeps the agent's
+   own tools verbatim and injects each required name **only when missing**.
+   Never append the four fingerprint tools unconditionally — OpenCode already
+   sends `bash`/`glob`/`grep`/`read` with its *real* schemas, so naively
+   appending duplicates the names → upstream `403 FreeTierError`.
+2. **Preserve the agent's tool schemas.** When the caller already provides
+   `bash` (with `command`), `glob`/`grep` (with `pattern`), `read` (with `path`),
+   those are the tools OpenCode can actually *execute*. Injecting a same-named
+   fingerprint tool with a different schema (`p`) corrupts the tool namespace and
+   makes the model emit `tool_call`s the agent cannot resolve — surfaced by
+   OpenCode as **`Tool not found`** (it maps `Unknown tool: <name>` →
+   `tool.unknown`). Keep the caller's schema; only fill gaps with the minimal
+   `p`-param stub.
+
+> If an agent reports `Tool not found` when calling a tool, suspect invariant #2:
+> the model is calling a name/param the agent did not register. Verify
+> `mergeTools()` is not overriding the agent's real tools with fingerprint stubs.
+
 ### Where to re-verify the gate
 `https://github.com/Fly143/OpenCode-Zen-free-api` `zen_check.py` is the canonical
 probe (it runs `ablate`/`host`/`relay` checks). Re-run it (or the live checks in
@@ -105,7 +125,7 @@ model:   opencode-free/big-pickle
 ## Test / validate
 
 ```bash
-npm test                 # 23 unit tests against a MOCK upstream (no network)
+npm test                 # 24 unit tests against a MOCK upstream (no network)
 ```
 
 Live end-to-end against the real free tier (expect 200 + SSE / aggregated JSON):
