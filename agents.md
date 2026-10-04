@@ -89,6 +89,30 @@ Concretely:
 > the model is calling a name/param the agent did not register. Verify
 > `mergeTools()` is not overriding the agent's real tools with fingerprint stubs.
 
+3. **Fingerprint tools the agent cannot run are executed server-side.** The gate
+   *requires* `glob` to be advertised, but many OpenAI-compatible clients (e.g.
+   pi-agent / pi-coding-agent) do **not** register a `glob` tool — they have
+   `find`/`ls` instead. When the model emits a tool_call for a fingerprint-named
+   tool the caller did not register (`glob`, and any of bash/grep/read the caller
+   omitted), the proxy runs it itself (see `executeFingerprintTool` in
+   `src/conversions.js`, supported by `resolveServerSideTools` in
+   `src/upstream.js`) and feeds the result back to the model as a synthetic tool
+   message. This keeps the relay usable for ANY client without leaking
+   unresolvable `tool_call`s. The agent's own registered tools are always handed
+   back to the agent to execute — only the synthetic fingerprint tools are
+   intercepted. The server-side implementations are dependency-free Node builtins
+   (glob/grep via `node:fs`, bash via `node:child_process`), bounded to 4 internal
+   tool-rounds and capped output (20 KB/tool result).
+
+> If an agent reports `Tool not found` even after invariants #1/#2, the failing
+> tool name is a fingerprint tool the agent doesn't register (almost always
+> `glob`). Confirm the proxy is executing it server-side rather than forwarding it.
+
+> Note: server-side execution currently applies to the **non-streaming** path
+> (`stream:false`), which is what the OpenAI completions API uses for agentic
+> tool loops. Streaming clients receive the raw upstream SSE; if a streaming
+> client lacks a fingerprint tool, that is a known gap to address when needed.
+
 ### Where to re-verify the gate
 `https://github.com/Fly143/OpenCode-Zen-free-api` `zen_check.py` is the canonical
 probe (it runs `ablate`/`host`/`relay` checks). Re-run it (or the live checks in
@@ -125,7 +149,7 @@ model:   opencode-free/big-pickle
 ## Test / validate
 
 ```bash
-npm test                 # 24 unit tests against a MOCK upstream (no network)
+npm test                 # 28 unit tests against a MOCK upstream (no network)
 ```
 
 Live end-to-end against the real free tier (expect 200 + SSE / aggregated JSON):

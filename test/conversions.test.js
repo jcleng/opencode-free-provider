@@ -4,10 +4,13 @@ import {
   serializeMessages,
   serializeTools,
   buildRequestBody,
+  buildWireBody,
   mergeTools,
   shapeCompletion,
   parseSse,
   translateStream,
+  executeFingerprintTool,
+  callerToolNames,
 } from '../src/conversions.js'
 import { splitModelId, findModel, isValidModel, listModelsPayload } from '../src/models.js'
 
@@ -153,4 +156,44 @@ test('translateStream forwards content and appends usage + finish', async functi
   const withFinish = out.filter((c) => c.choices && c.choices[0] && c.choices[0].finish_reason)
   assert.ok(withFinish.length >= 1)
   assert.equal(withFinish[withFinish.length - 1].choices[0].finish_reason, 'stop')
+})
+
+test('callerToolNames collects the agent-registered tool names', function () {
+  const set = callerToolNames([
+    { type: 'function', function: { name: 'bash', parameters: {} } },
+    { type: 'function', function: { name: 'read' } },
+  ])
+  assert.deepEqual([...set].sort(), ['bash', 'read'])
+})
+
+test('buildWireBody keeps pre-serialized wire messages verbatim', function () {
+  const wire = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'ok', tool_calls: [{ id: '1', type: 'function', function: { name: 'glob', arguments: '{}' } }] }, { role: 'tool', tool_call_id: '1', content: 'x' }]
+  const body = buildWireBody({ model: 'big-pickle', wireMessages: wire, maxTokens: 1000 })
+  assert.equal(body.stream, true)
+  assert.deepEqual(body.messages, wire)
+  // fingerprint tools must still be present
+  assert.deepEqual(body.tools.map((t) => t.function.name).sort(), ['bash', 'glob', 'grep', 'read'])
+})
+
+test('executeFingerprintTool runs glob against the full relative path', async function () {
+  const cwd = process.cwd()
+  const r = await executeFingerprintTool('glob', { pattern: 'src/**/*.js' }, cwd)
+  assert.ok(r.ok)
+  assert.ok(r.content.split('\n').includes('src/config.js'))
+  const none = await executeFingerprintTool('glob', { pattern: '**/*.does-not-exist' }, cwd)
+  assert.match(none.content, /no files/)
+})
+
+test('executeFingerprintTool runs bash, grep and read', async function () {
+  const cwd = process.cwd()
+  const b = await executeFingerprintTool('bash', { command: 'echo hello-probe' }, cwd)
+  assert.match(b.content, /hello-probe/)
+  const g = await executeFingerprintTool('grep', { pattern: 'buildWireBody', path: 'src' }, cwd)
+  assert.ok(g.content.includes('src/conversions.js'))
+  const rd = await executeFingerprintTool('read', { path: 'package.json' }, cwd)
+  assert.ok(rd.content.includes('name'))
+  const missing = await executeFingerprintTool('read', { path: 'nope.json' }, cwd)
+  assert.match(missing.content, /File not found/)
+  // unknown name returns null (caller should execute it)
+  assert.equal(await executeFingerprintTool('weirdtool', {}, cwd), null)
 })

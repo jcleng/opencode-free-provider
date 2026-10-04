@@ -100,6 +100,14 @@ export const ZEN_FREE_TOOLS = [
   { type: 'function', function: { name: 'read', description: 'read', parameters: { type: 'object', properties: { p: { type: 'string' } }, required: ['p'] } } },
 ]
 
+// The set of tool names the upstream gate forces us to advertise. Used to decide
+// whether a tool_call the model emits must be executed server-side (when the
+// calling agent does not register that exact name).
+export const FINGERPRINT_TOOL_NAMES = new Set(ZEN_FREE_TOOLS.map((t) => t.function.name))
+export function isFingerprintTool(name) {
+  return FINGERPRINT_TOOL_NAMES.has(name)
+}
+
 // OpenCode Zen free models (mirrors the official free tier). id === model name
 // sent to the upstream /chat/completions. provider is the local /v1 namespace.
 //

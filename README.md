@@ -105,7 +105,7 @@ must be verified live against the free tier before being added back.
 ## Test
 
 ```bash
-npm test             # 24 unit tests (mock upstream)
+npm test             # 28 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the
@@ -117,6 +117,16 @@ fingerprint described above.
 > tools and injects each required name only when missing, so OpenCode's real
 > `bash`/`glob`/`grep`/`read` (with their `command`/`path`/`pattern` schemas) are
 > preserved — the model emits tool calls the agent can actually execute.
+>
+> Some OpenAI-compatible clients (e.g. pi-agent / pi-coding-agent) do **not**
+> register a `glob` tool (they use `find`/`ls`). Because the gate forces `glob` to
+> be advertised, the model may call it and the client would report
+> `Tool not found`. To avoid that, the proxy **executes the fingerprint tools the
+> client didn't register server-side** (`executeFingerprintTool` in
+> `src/conversions.js`, wired through `resolveServerSideTools` in `src/upstream.js`)
+> and feeds the result back to the model — with no extra dependencies (glob/grep
+> use `node:fs`, bash uses `node:child_process`). The agent's own registered tools
+> are always returned to the agent for execution.
 
 ## License
 

@@ -1,4 +1,16 @@
-import { ZEN_FREE_TOOLS } from './config.js'
+import { ZEN_FREE_TOOLS, isFingerprintTool } from './config.js'
+import { execFile } from 'node:child_process'
+import { readFile, readdir } from 'node:fs/promises'
+import { existsSync, statSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+const execFileP = promisify(execFile)
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+// Resolve relative to repo root (src/ -> repo root); used as the default cwd for
+// server-side fingerprint tool execution.
+const ROOT = path.resolve(__dirname, '..')
 
 // Conversions between the OpenAI chat.completions wire format (what agents
 // send to /v1/chat/completions) and the wire format OpenCode Zen expects
@@ -56,7 +68,162 @@ export function serializeTools(tools) {
   }))
 }
 
-// SSE line parser. Yields parsed JSON objects per `data:` line. Stops at [DONE].
+// Server-side execution of the fingerprint tools the upstream gate requires
+// (bash/glob/grep/read). These must be present in the request tools array, but
+// the calling agent may not register every one of them (e.g. pi-agent has bash,
+// grep and read but NOT glob). When the model calls such a tool the agent would
+// otherwise report "Tool <name> not found". To keep the relay usable for ANY
+// OpenAI-compatible client, we execute the fingerprint tools ourselves and feed
+// the result back into the conversation as a synthetic tool message.
+//
+// Callers' own tools are never executed here — the agent does that. We only run
+// the synthetic fingerprint tools (those the gate forces us to advertise). If a
+// client already registers a real `bash`/`grep`/`read`, the model may call
+// either; we only intercept the fingerprint-named ones we injected.
+export async function executeFingerprintTool(name, args, cwd, signal) {
+  switch (name) {
+    case 'bash': {
+      const cmd = args?.command
+      if (typeof cmd !== 'string' || cmd.length === 0) return err('Missing command')
+      try {
+        const { stdout, stderr } = await execFileP('sh', ['-c', cmd], {
+          cwd: cwd || ROOT, maxBuffer: 8 * 1024 * 1024, signal,
+        })
+        return ok(stdout || stderr || '')
+      } catch (e) {
+        return ok((e.stdout || '') + (e.stderr || '') + `\n[exit ${e.code ?? '?'}]`)
+      }
+    }
+    case 'glob': {
+      const pattern = args?.pattern || args?.p
+      if (typeof pattern !== 'string' || pattern.length === 0) return err('Missing pattern')
+      try {
+        const files = await nodeGlob(pattern, cwd || ROOT)
+        return ok(files.length ? files.join('\n') : '(no files)')
+      } catch (e) {
+        return err(String(e?.message || e))
+      }
+    }
+    case 'grep': {
+      const pattern = args?.pattern || args?.p
+      if (typeof pattern !== 'string' || pattern.length === 0) return err('Missing pattern')
+      const pathArg = args?.path || '.'
+      try {
+        const results = await nodeGrep(pattern, pathArg, cwd || ROOT, {
+          ignoreCase: !!args?.['-i'], lineNumbers: args?.['-n'] !== false, glob: args?.glob,
+        })
+        return ok(results.length ? results.join('\n') : '(no matches)')
+      } catch (e) {
+        return ok(`(error: ${String(e?.message || e)})`)
+      }
+    }
+    case 'read': {
+      const p = args?.path || args?.p
+      if (typeof p !== 'string' || p.length === 0) return err('Missing path')
+      const abs = path.isAbsolute(p) ? p : path.resolve(cwd || ROOT, p)
+      if (!existsSync(abs)) return err(`File not found: ${p}`)
+      try {
+        const data = await readFile(abs, 'utf8')
+        return ok(data)
+      } catch (e) {
+        return err(String(e?.message || e))
+      }
+    }
+    default:
+      return null
+  }
+}
+
+// Minimal glob/regex search using only Node builtins (no external `rg` needed).
+async function nodeGlob(pattern, cwd, seen = new Set(), results = [], root = null) {
+  // `root` is the original search root; we always match the glob against the
+  // path relative to `root` (so `src/**/*.js` matches `src/config.js`).
+  if (root === null) root = path.resolve(cwd)
+  // Translate a shell-style glob into a regex (supports **, *, ?, [..]).
+  const re = globToRegExp(pattern)
+  const dir = path.resolve(cwd)
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return results
+  }
+  for (const ent of entries) {
+    if (ent.name === 'node_modules' || ent.name === '.git') continue
+    const full = path.join(dir, ent.name)
+    if (ent.isDirectory()) {
+      await nodeGlob(pattern, full, seen, results, root)
+    } else {
+      // Match the glob against the full relative path (so `**/*.mjs` works),
+      // not just the basename.
+      const rel = path.relative(root, full)
+      if (re.test(rel) && !seen.has(rel)) { seen.add(rel); results.push(rel) }
+    }
+  }
+  return results
+}
+
+async function nodeGrep(pattern, target, cwd, opts) {
+  const re = new RegExp(pattern, opts.ignoreCase ? 'i' : '')
+  const out = []
+  const absTarget = path.isAbsolute(target) ? target : path.resolve(cwd, target)
+  async function walk(dir) {
+    let entries
+    try { entries = await readdir(dir, { withFileTypes: true }) } catch { return }
+    for (const ent of entries) {
+      if (ent.name === 'node_modules' || ent.name === '.git') continue
+      const full = path.join(dir, ent.name)
+      if (ent.isDirectory()) { await walk(full); continue }
+      if (opts.glob && !globToRegExp(opts.glob).test(ent.name)) continue
+      try {
+        const text = await readFile(full, 'utf8')
+        const rel = path.relative(cwd, full)
+        text.split('\n').forEach((line, i) => {
+          if (re.test(line)) out.push(`${opts.lineNumbers ? i + 1 + ':' : ''}${rel}:${line}`)
+        })
+      } catch { /* skip unreadable */ }
+    }
+  }
+  if (existsSync(absTarget) && statSync(absTarget).isFile()) {
+    const text = await readFile(absTarget, 'utf8')
+    const rel = path.relative(cwd, absTarget)
+    text.split('\n').forEach((line, i) => { if (re.test(line)) out.push(`${opts.lineNumbers ? i + 1 + ':' : ''}${rel}:${line}`) })
+  } else {
+    await walk(absTarget)
+  }
+  return out
+}
+
+function globToRegExp(glob) {
+  const special = new Set(['.', '+', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\'])
+  let re = '^'
+  let i = 0
+  while (i < glob.length) {
+    const c = glob[i]
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        // `**` then an optional slash: matches zero or more path segments.
+        let j = i + 2
+        if (glob[j] === '/') j++ // consume the slash after **
+        re += '(?:.*/)?'
+        i = j
+        continue
+      }
+      re += '[^/]*'
+    } else if (c === '?') re += '[^/]'
+    else if (special.has(c)) re += '\\' + c
+    else re += c
+    i++
+  }
+  return new RegExp(re + '$')
+}
+
+function ok(content) {
+  return { ok: true, content: String(content).slice(0, 20000) }
+}
+function err(message) {
+  return { ok: true, content: `Error: ${message}` }
+}
 export async function* parseSse(response) {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -191,16 +358,29 @@ export async function* translateStream(rawChunks, estimateInput) {
   void nextIndex
 }
 
-// Build the chat.completions request body for OpenCode Zen.
-//
-// IMPORTANT: the upstream free-tier gateway ONLY accepts stream:true. We always
-// force it on internally (the relay converts the upstream SSE back to a single
-// JSON object when the agent asked for non-streaming). We also always include
-// the four mandatory fingerprint tools (bash/glob/grep/read) — the upstream
-// rejects any body missing any of them with 403 FreeTierError.
+// Build the chat.completions request body for OpenCode Zen, serializing the
+// agent's internal messages + tools into wire format.
 export function buildRequestBody({ model, messages, system, tools, maxTokens, temperature, stream, topP }) {
   const wireMessages = serializeMessages(messages, system)
   const wireTools = mergeTools(tools)
+  return finalizeBody({ model, wireMessages, wireTools, maxTokens, temperature, topP })
+}
+
+// Build a request body from messages/tools that are ALREADY in OpenAI wire format
+// (used for server-side follow-up turns where we re-feed a running conversation
+// of assistant tool-call + tool-result messages).
+export function buildWireBody({ model, wireMessages, wireTools, maxTokens, temperature, topP }) {
+  return finalizeBody({
+    model,
+    wireMessages,
+    wireTools: wireTools || mergeTools([]),
+    maxTokens,
+    temperature,
+    topP,
+  })
+}
+
+function finalizeBody({ model, wireMessages, wireTools, maxTokens, temperature, topP }) {
   return {
     model,
     messages: wireMessages,
@@ -243,6 +423,19 @@ export function mergeTools(tools) {
   //    provide one with that exact name. This guarantees no duplicate names.
   for (const t of ZEN_FREE_TOOLS) add(t)
   return out
+}
+
+// Returns the set of tool names the caller registered (used to decide which
+// tool_calls the model emits must be executed server-side vs. handed to the
+// calling agent). Fingerprint-only tools the agent does not register are run by
+// the proxy so they never surface as "Tool <name> not found".
+export function callerToolNames(tools) {
+  const set = new Set()
+  for (const t of tools || []) {
+    const n = t?.function?.name
+    if (n) set.add(n)
+  }
+  return set
 }
 
 // Shape a single upstream non-streaming completion into the OpenAI response.

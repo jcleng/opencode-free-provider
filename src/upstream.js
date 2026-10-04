@@ -1,9 +1,11 @@
 import {
   getOpencodeBase, OPENCODE_UA, OPENCODE_CLIENT, OPENCODE_PROJECT,
   LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
-  currentSession, newRequestId,
+  currentSession, newRequestId, isFingerprintTool,
 } from './config.js'
-import { buildRequestBody, parseSse, translateStream } from './conversions.js'
+import {
+  buildRequestBody, buildWireBody, parseSse, translateStream, executeFingerprintTool, callerToolNames,
+} from './conversions.js'
 
 function resolveApiKey() {
   return process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_GO_API_KEY || LITERAL_KEY
@@ -36,8 +38,13 @@ function fingerprintHeaders() {
  * Relay a chat.completions request to OpenCode Zen free tier.
  *
  * The upstream only accepts stream:true with the four fingerprint tools, so we
- * always request streaming upstream. When the agent asked for `stream:false`
- * we collect the upstream SSE and resolve a single shaped completion object.
+ * always request streaming upstream. When the agent asked for `stream:false` we
+ * collect the upstream SSE and resolve a single shaped completion object.
+ *
+ * Fingerprint tool calls the calling agent does NOT register (e.g. `glob` for
+ * pi-agent) are executed server-side and fed back to the model internally, so
+ * the agent never sees a "Tool <name> not found" error. Agent-registered tools
+ * are always handed back to the agent to execute.
  *
  * Returns an async generator of OpenAI streaming chunks when stream=true, or a
  * single shaped completion object when stream=false.
@@ -47,11 +54,16 @@ export async function* relayChatCompletions(opts) {
     model, messages, system, tools, maxTokens, temperature, stream, topP, signal, timeoutMs,
   } = opts
 
-  const body = buildRequestBody({
+  const clientToolNames = callerToolNames(tools)
+  const baseBody = buildRequestBody({
     model, messages, system, tools,
     maxTokens: maxTokens || DEFAULT_MAX_TOKENS,
     temperature, stream: true, topP,
   })
+
+  // The wire conversation we keep re-sending to upstream (starts as the request
+  // body's messages; grows with assistant tool-call + tool-result messages).
+  let wireMessages = baseBody.messages
 
   let lastError = null
   const attempts = Math.max(1, MAX_REQUEST_ATTEMPTS)
@@ -67,6 +79,7 @@ export async function* relayChatCompletions(opts) {
       onAbort = () => controller.abort()
       if (signal) signal.addEventListener('abort', onAbort)
 
+      const body = { ...baseBody, messages: wireMessages }
       response = await fetch(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST',
         headers: fingerprintHeaders(),
@@ -96,12 +109,16 @@ export async function* relayChatCompletions(opts) {
     }
 
     const ctype = response.headers.get('content-type') || ''
-    const estimateInput = () => JSON.stringify(body.messages)
+    const estimateInput = () => JSON.stringify(wireMessages)
 
-    // Non-streaming for the agent: upstream is always SSE, so aggregate it.
+    // Non-streaming for the agent: upstream is always SSE, so aggregate it,
+    // running any fingerprint-only tool calls server-side (so the agent never
+    // sees a tool it cannot execute). We keep the running wire conversation in a
+    // local variable so the server-side loop can re-feed tool results.
     if (!stream) {
       const aggregated = await aggregateSse(response, model, estimateInput)
-      yield aggregated
+      const resolved = await resolveServerSideTools(aggregated, opts, clientToolNames, wireMessages)
+      yield resolved
       return
     }
 
@@ -119,8 +136,68 @@ export async function* relayChatCompletions(opts) {
   throw lastError || new Error('OpenCode Zen request failed')
 }
 
-// Turn a single upstream JSON completion into a one-chunk async iterable that
-// translateStream can ingest (handles the rare non-SSE success path).
+/**
+ * Given a completed (non-streaming) response, run any fingerprint tool calls the
+ * calling agent cannot execute server-side, then continue the conversation with
+ * upstream until the model either emits only agent-executable tool_calls or
+ * produces a final answer. `setWire` persists the running conversation and
+ * returns the next request body to send upstream.
+ */
+async function resolveServerSideTools(completion, opts, clientToolNames, initialMessages) {
+  let current = completion
+  let wire = [...initialMessages]
+  const maxServerTurns = 4 // safety bound for server-side tool rounds
+  for (let turn = 0; turn < maxServerTurns; turn++) {
+    const tcs = current.choices?.[0]?.message?.tool_calls || []
+    if (tcs.length === 0) break
+
+    const serverCalls = tcs.filter(
+      (tc) => isFingerprintTool(tc.function?.name) && !clientToolNames.has(tc.function?.name),
+    )
+    // Nothing for us to run: hand the whole message back to the agent.
+    if (serverCalls.length === 0) break
+
+    // Append the assistant message (with its tool_calls) to the conversation.
+    const assistantMsg = current.choices[0].message
+    if (assistantMsg.content === '' && assistantMsg.tool_calls) assistantMsg.content = null
+    wire = [...wire, assistantMsg]
+
+    // Execute the server-side calls and collect synthetic tool results.
+    const toolResults = await Promise.all(
+      serverCalls.map(async (tc) => {
+        let args = {}
+        try { args = JSON.parse(tc.function?.arguments || '{}') } catch { /* ignore */ }
+        const res = await executeFingerprintTool(tc.function?.name, args, opts.cwd, opts.signal)
+        return {
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: res ? res.content : `Error: cannot run tool ${tc.function?.name}`,
+        }
+      }),
+    )
+
+    // Re-feed the running conversation + tool results to upstream for the next turn.
+    const nextBody = buildWireBody({
+      model: opts.model,
+      wireMessages: [...wire, ...toolResults],
+      wireTools: buildRequestBody({ model: opts.model, messages: opts.messages, system: opts.system, tools: opts.tools || [], maxTokens: opts.maxTokens || DEFAULT_MAX_TOKENS, temperature: opts.temperature, stream: true, topP: opts.topP }).tools,
+      maxTokens: opts.maxTokens || DEFAULT_MAX_TOKENS,
+      temperature: opts.temperature,
+      topP: opts.topP,
+    })
+    const response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+      method: 'POST',
+      headers: fingerprintHeaders(),
+      body: JSON.stringify(nextBody),
+      signal: AbortSignal.timeout(opts.timeoutMs || 60000),
+    })
+    if (!response.ok) break
+    const estimateInput = () => JSON.stringify(nextBody.messages)
+    current = await aggregateSse(response, opts.model, estimateInput)
+  }
+  return current
+}
+
 async function* aggregateToChunks(payload) {
   yield payload
 }
