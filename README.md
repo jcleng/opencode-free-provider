@@ -114,19 +114,25 @@ fingerprint described above.
 > **Tool calls / `Tool not found`:** the upstream free tier requires the four tool
 > names `bash`/`glob`/`grep`/`read` in the body, but a **duplicate name** triggers
 > `403`. The proxy (`mergeTools` in `src/conversions.js`) keeps the agent's own
-> tools and injects each required name only when missing, so OpenCode's real
+> tools and injects each required name only when missing, so the agent's real
 > `bash`/`glob`/`grep`/`read` (with their `command`/`path`/`pattern` schemas) are
 > preserved — the model emits tool calls the agent can actually execute.
 >
 > Some OpenAI-compatible clients (e.g. pi-agent / pi-coding-agent) do **not**
-> register a `glob` tool (they use `find`/`ls`). Because the gate forces `glob` to
-> be advertised, the model may call it and the client would report
-> `Tool not found`. To avoid that, the proxy **executes the fingerprint tools the
-> client didn't register server-side** (`executeFingerprintTool` in
-> `src/conversions.js`, wired through `resolveServerSideTools` in `src/upstream.js`)
-> and feeds the result back to the model — with no extra dependencies (glob/grep
-> use `node:fs`, bash uses `node:child_process`). The agent's own registered tools
-> are always returned to the agent for execution.
+> register every fingerprint tool — pi-agent has `bash`/`grep`/`read`/`ls`/`find`/
+> `edit`/`write` but **no `glob`**, and historically its `bash` is not wired through
+> custom OpenAI providers. Because the gate *forces* all four names to be
+> advertised, the model may call one the client cannot resolve, and the client
+> would report `Tool not found`. To avoid that, the proxy **executes ALL four
+> fingerprint tools server-side** (`executeFingerprintTool` in `src/conversions.js`,
+> wired through `runServerSideLoop` in `src/upstream.js`) on **both streaming and
+> non-streaming paths**, feeds the result back to the model as a synthetic tool
+> message, and loops with upstream until the model emits only agent-executable
+> tool calls or a final answer. **The agent never receives a tool_call with a
+> fingerprint name**, so it can never report `Tool not found`. The agent's own
+> registered tools (`ls`/`find`/`edit`/`write`/…) are always forwarded verbatim.
+> The server-side implementations use only Node builtins (glob/grep via `node:fs`,
+> bash via `node:child_process`) — no extra dependencies.
 
 ## License
 

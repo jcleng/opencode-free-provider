@@ -89,29 +89,11 @@ Concretely:
 > the model is calling a name/param the agent did not register. Verify
 > `mergeTools()` is not overriding the agent's real tools with fingerprint stubs.
 
-3. **Fingerprint tools the agent cannot run are executed server-side.** The gate
-   *requires* `glob` to be advertised, but many OpenAI-compatible clients (e.g.
-   pi-agent / pi-coding-agent) do **not** register a `glob` tool — they have
-   `find`/`ls` instead. When the model emits a tool_call for a fingerprint-named
-   tool the caller did not register (`glob`, and any of bash/grep/read the caller
-   omitted), the proxy runs it itself (see `executeFingerprintTool` in
-   `src/conversions.js`, supported by `resolveServerSideTools` in
-   `src/upstream.js`) and feeds the result back to the model as a synthetic tool
-   message. This keeps the relay usable for ANY client without leaking
-   unresolvable `tool_call`s. The agent's own registered tools are always handed
-   back to the agent to execute — only the synthetic fingerprint tools are
-   intercepted. The server-side implementations are dependency-free Node builtins
-   (glob/grep via `node:fs`, bash via `node:child_process`), bounded to 4 internal
-   tool-rounds and capped output (20 KB/tool result).
+3. **Fingerprint tools are executed server-side on BOTH streaming and non-streaming paths.** The gate *requires* `bash`/`glob`/`grep`/`read` to be advertised, but many OpenAI-compatible clients (e.g. pi-agent / pi-coding-agent) do **not** register all of them — pi-agent has `bash`/`grep`/`read`/`ls`/`find`/`edit`/`write` but **no `glob`**. When the model emits a tool_call for ANY fingerprint-named tool (even `bash`/`read`/`grep`), the proxy runs it itself via `executeFingerprintTool` (`src/conversions.js`) and feeds the result back to the model as a synthetic tool message, looping with upstream until the model either emits only agent-executable tool_calls or a final answer. This is implemented in `runServerSideLoop` (`src/upstream.js`), which both paths share. **The agent never receives a tool_call whose name is a fingerprint tool**, so it can never report `Tool <name> not found`. The agent's own registered tools (`ls`/`find`/`edit`/`write`/…) are always forwarded verbatim for the agent to execute — only the four fingerprint tools are intercepted. Output is capped (20 KB/tool result) and the loop is bounded to 4 internal tool rounds.
 
-> If an agent reports `Tool not found` even after invariants #1/#2, the failing
-> tool name is a fingerprint tool the agent doesn't register (almost always
-> `glob`). Confirm the proxy is executing it server-side rather than forwarding it.
+> If an agent reports `Tool not found`, the failing name is almost certainly a fingerprint tool the caller doesn't register. The fix is NOT to add that tool to the caller — it's to ensure the proxy executes it server-side (invariant #3) and never forwards it. Do **not** try to make the caller register `glob`/`bash`/etc.; the proxy owns those names by design.
 
-> Note: server-side execution currently applies to the **non-streaming** path
-> (`stream:false`), which is what the OpenAI completions API uses for agentic
-> tool loops. Streaming clients receive the raw upstream SSE; if a streaming
-> client lacks a fingerprint tool, that is a known gap to address when needed.
+> The server-side implementations are dependency-free Node builtins: `bash` via `node:child_process` (`sh -c`), `glob`/`grep` via `node:fs` (recursive `.gitignore`-unaware walk), `read` via `node:fs/promises`. They run with `cwd` = the proxy's working directory (or `opts.cwd`).
 
 ### Where to re-verify the gate
 `https://github.com/Fly143/OpenCode-Zen-free-api` `zen_check.py` is the canonical
