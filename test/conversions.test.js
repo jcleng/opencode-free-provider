@@ -9,9 +9,12 @@ import {
   shapeCompletion,
   parseSse,
   translateStream,
-  executeFingerprintTool,
   callerToolNames,
+  translateFingerprintCall,
+  encodeTranslatedId,
+  decodeTranslatedId,
 } from '../src/conversions.js'
+import { isFingerprintTool } from '../src/config.js'
 import { splitModelId, findModel, isValidModel, listModelsPayload } from '../src/models.js'
 
 test('splitModelId handles provider/model and bare id', () => {
@@ -175,25 +178,68 @@ test('buildWireBody keeps pre-serialized wire messages verbatim', function () {
   assert.deepEqual(body.tools.map((t) => t.function.name).sort(), ['bash', 'glob', 'grep', 'read'])
 })
 
-test('executeFingerprintTool runs glob against the full relative path', async function () {
-  const cwd = process.cwd()
-  const r = await executeFingerprintTool('glob', { pattern: 'src/**/*.js' }, cwd)
-  assert.ok(r.ok)
-  assert.ok(r.content.split('\n').includes('src/config.js'))
-  const none = await executeFingerprintTool('glob', { pattern: '**/*.does-not-exist' }, cwd)
-  assert.match(none.content, /no files/)
+test('serializeMessages handles standard OpenAI tool_calls + role:tool', function () {
+  // The agent (and the proxy round-trip) use standard OpenAI format, not just
+  // pi-agent content blocks. Verify both are preserved.
+  const wire = serializeMessages([
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'file.txt' },
+  ])
+  assert.equal(wire[0].role, 'assistant')
+  assert.deepEqual(wire[0].tool_calls, [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls"}' } }])
+  assert.equal(wire[1].role, 'tool')
+  assert.equal(wire[1].tool_call_id, 'c1')
+  assert.equal(wire[1].content, 'file.txt')
 })
 
-test('executeFingerprintTool runs bash, grep and read', async function () {
-  const cwd = process.cwd()
-  const b = await executeFingerprintTool('bash', { command: 'echo hello-probe' }, cwd)
-  assert.match(b.content, /hello-probe/)
-  const g = await executeFingerprintTool('grep', { pattern: 'buildWireBody', path: 'src' }, cwd)
-  assert.ok(g.content.includes('src/conversions.js'))
-  const rd = await executeFingerprintTool('read', { path: 'package.json' }, cwd)
-  assert.ok(rd.content.includes('name'))
-  const missing = await executeFingerprintTool('read', { path: 'nope.json' }, cwd)
-  assert.match(missing.content, /File not found/)
-  // unknown name returns null (caller should execute it)
-  assert.equal(await executeFingerprintTool('weirdtool', {}, cwd), null)
+test('encode/decode of translated ids is reversible', function () {
+  const id = encodeTranslatedId('call_9', 'glob', '{"pattern":"*.js"}')
+  assert.ok(id.startsWith('tr:'))
+  const decoded = decodeTranslatedId(id)
+  assert.deepEqual(decoded, { i: 'call_9', n: 'glob', a: '{"pattern":"*.js"}' })
+  assert.equal(decodeTranslatedId('normal-id'), null)
+})
+
+test('serializeMessages restores translated tool_calls + tool results for upstream', function () {
+  const id = encodeTranslatedId('call_9', 'glob', '{"pattern":"*.js"}')
+  const wire = serializeMessages([
+    { role: 'assistant', content: null, tool_calls: [{ id: id, type: 'function', function: { name: 'bash', arguments: '{"command":"shopt ..."}' } }] },
+    { role: 'tool', tool_call_id: id, content: 'a.js\nb.js' },
+  ])
+  // The assistant tool_call is mapped back to the original fingerprint name/id.
+  assert.deepEqual(wire[0].tool_calls, [{ id: 'call_9', type: 'function', function: { name: 'glob', arguments: '{"pattern":"*.js"}' } }])
+  // The tool result is mapped back to the original tool_call_id.
+  assert.equal(wire[1].tool_call_id, 'call_9')
+  assert.equal(wire[1].content, 'a.js\nb.js')
+})
+
+test('translateFingerprintCall maps glob -> bash when bash is available', function () {
+  const tr = translateFingerprintCall('glob', { pattern: 'src/**/*.js' }, new Set(['bash', 'grep', 'read']))
+  assert.equal(tr.name, 'bash')
+  assert.ok(tr.arguments.command.includes('globstar'))
+  assert.ok(tr.arguments.command.includes('src/**/*.js'))
+})
+
+test('translateFingerprintCall prefers bash, falls back to find', function () {
+  const tr = translateFingerprintCall('glob', { pattern: '*.ts' }, new Set(['find']))
+  assert.equal(tr.name, 'find')
+})
+
+test('translateFingerprintCall returns null when no agent tool can stand in', function () {
+  assert.equal(translateFingerprintCall('glob', { pattern: '*' }, new Set(['edit', 'write'])), null)
+  assert.equal(translateFingerprintCall('grep', { pattern: 'x' }, new Set(['edit', 'write'])), null)
+})
+
+test('translateFingerprintCall maps grep -> bash grep', function () {
+  const tr = translateFingerprintCall('grep', { pattern: 'foo', path: 'src' }, new Set(['bash']))
+  assert.equal(tr.name, 'bash')
+  assert.ok(tr.arguments.command.includes('grep'))
+})
+
+test('isFingerprintTool identifies the gate-required names', function () {
+  assert.equal(isFingerprintTool('glob'), true)
+  assert.equal(isFingerprintTool('bash'), true)
+  assert.equal(isFingerprintTool('read'), true)
+  assert.equal(isFingerprintTool('grep'), true)
+  assert.equal(isFingerprintTool('weirdtool'), false)
 })

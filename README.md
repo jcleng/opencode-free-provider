@@ -105,7 +105,7 @@ must be verified live against the free tier before being added back.
 ## Test
 
 ```bash
-npm test             # 28 unit tests (mock upstream)
+npm test             # 38 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the
@@ -120,26 +120,38 @@ fingerprint described above.
 >
 > Some OpenAI-compatible clients (e.g. pi-agent / pi-coding-agent) do **not**
 > register every fingerprint tool — pi-agent has `bash`/`grep`/`read`/`ls`/`find`/
-> `edit`/`write` but **no `glob`**, and historically its `bash` is not wired through
-> custom OpenAI providers. Because the gate *forces* all four names to be
+> `edit`/`write` but **no `glob`**. Because the gate *forces* all four names to be
 > advertised, the model may call one the client cannot resolve, and the client
-> would report `Tool not found`. The proxy keeps all four names on the wire (the
-> gate requires them) but only **executes server-side the ones the caller did NOT
-> register** — its backstop set is `fingerprint names − caller tool names`
-> (`serverToolNames` in `src/upstream.js`, computed per request via
-> `callerToolNames`). Registered caller tools are forwarded verbatim for the agent
-> to run itself; the proxy only runs the gate-required names the caller lacks
-> (e.g. pi-agent lacks `glob`, so the proxy runs just `glob`). Whichever it runs,
-> `executeFingerprintTool` (`src/conversions.js`, wired through `runServerSideLoop`
-> in `src/upstream.js`) applies on **both streaming and non-streaming paths**; the
-> result is fed back as a synthetic tool message and the proxy loops with upstream
-> until the model emits only agent-executable tool calls or a final answer.
-> **The agent never receives a tool_call whose name is in the proxy's backstop
-> set**, so it can never report `Tool not found`. The agent's own registered tools
-> (`ls`/`find`/`edit`/`write`/… and any of `bash`/`glob`/`grep`/`read` it provides)
-> are always forwarded verbatim. The server-side implementations use only Node
-> builtins (glob/grep via `node:fs`, bash via `node:child_process`) — no extra
-> dependencies.
+> would report `Tool not found`. The proxy is a **pure forwarder + translator**:
+> it never executes tools itself (no `node:child_process`, no `node:fs`, no
+> server-side cwd/`/app`). It keeps all four names on the wire (the gate requires
+> them) and, **whenever the model emits a fingerprint tool the caller did NOT
+> register**, **rewrites that tool_call into a tool the agent DOES implement** —
+> via `translateFingerprintCall` (`src/conversions.js`), driven by
+> `runTranslateLoop` (`src/upstream.js`). For example, a `glob` call the agent
+> lacks becomes a `bash` call with a globstar loop (`shopt -s globstar nullglob;
+> for f in <pattern>; do echo "$f"; done`); the **agent** then executes it in its
+> own working directory and returns the listing as ordinary text. If no registered
+> tool can stand in for a fingerprint call (e.g. the agent has neither `bash` nor
+> `find` for `glob`), the proxy relays a textual note back to upstream itself (a
+> pure relay round-trip, still no execution) and lets the model continue.
+> **The agent never receives a tool_call name it cannot resolve**, so it can never
+> report `Tool not found`. The agent's own registered tools (and any fingerprint
+> tool it *does* register) are always forwarded verbatim; only the names the agent
+> lacks are translated. The original↔translated mapping survives the stateless
+> request boundary by encoding the original call into the tool_call id (`tr:`
+> prefix); on the agent's follow-up, `serializeMessages` restores the original
+> call and folds the agent's real result back into the conversation as natural
+> language.
+>
+> **No working-directory plumbing.** The proxy receives no cwd — no
+> `x-opencode-cwd` header, no body `cwd`/`workdir`. Because it never runs tools,
+> there is no server-side directory to get wrong; the agent's filesystem is
+> authoritative.
+>
+> **Best setup:** register `glob` (and `grep`/`read` if you can) on the client
+> itself. The agent then executes those tools in its own filesystem, so the proxy
+> forwards them verbatim and performs no translation at all.
 
 ## License
 

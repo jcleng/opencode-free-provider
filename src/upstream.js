@@ -1,10 +1,11 @@
 import {
   getOpencodeBase, OPENCODE_UA, OPENCODE_CLIENT, OPENCODE_PROJECT,
   LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
-  currentSession, newRequestId, FINGERPRINT_TOOL_NAMES,
+  currentSession, newRequestId, isFingerprintTool,
 } from './config.js'
 import {
-  buildRequestBody, buildWireBody, parseSse, translateStream, executeFingerprintTool, callerToolNames,
+  buildRequestBody, buildWireBody, parseSse, translateStream,
+  callerToolNames, translateFingerprintCall, encodeTranslatedId,
 } from './conversions.js'
 
 function resolveApiKey() {
@@ -34,32 +35,28 @@ function fingerprintHeaders() {
   }
 }
 
-// The set of fingerprint tool names the upstream gate forces us to advertise.
-// Which of these the proxy actually executes is decided per-request (see
-// `serverToolNames` in relayChatCompletions): only the ones the calling agent
-// did NOT register. This keeps the gate-satisfying names on the wire while
-// handing real tool execution back to the agent wherever it can run them.
+// The set of fingerprint tool names the upstream gate forces us to advertise
+// (bash/glob/grep/read). The proxy never executes them; when the calling agent
+// does not implement one, runTranslateLoop rewrites that tool_call into an
+// agent-supported tool so the agent runs it itself.
 
 /**
  * Relay a chat.completions request to OpenCode Zen free tier.
  *
- * The upstream only accepts stream:true with the four fingerprint tools, so we
- * always request streaming upstream. When the agent asked for `stream:false` we
- * collect the upstream SSE and resolve a single shaped completion object.
+ * The proxy is a PURE forwarder: it never executes tools itself. The upstream
+ * gate forces the tool names bash/glob/grep/read onto the wire, but the calling
+ * agent (e.g. pi-agent) does not necessarily implement every one of them
+ * (pi-agent has bash/grep/read but no `glob`). When the model emits a
+ * fingerprint tool the agent cannot run, the proxy rewrites that tool_call into
+ * a tool the agent DOES implement (e.g. `glob` -> `bash` with a globstar loop),
+ * hands the rewritten call to the agent, and lets the agent execute it in ITS
+ * OWN working directory. The agent's real result is then fed back to the model
+ * as ordinary text. This keeps the relay usable for ANY OpenAI-compatible
+ * client without the proxy ever touching the filesystem or assuming a cwd.
  *
- * The fingerprint tools (bash / glob / grep / read) are NOT real tools the
- * calling agent (e.g. pi-agent) can necessarily execute — pi-agent has no
- * `glob`, and historically its `bash` is not wired through custom OpenAI
- * providers. When the model emits one of these names the agent would surface a
- * "Tool <name> not found" error. To keep the relay usable for ANY OpenAI-
- * compatible client, we keep all four names on the wire (the gate requires
- * them) but only execute server-side the ones the calling agent did NOT
- * register. Registered caller tools are forwarded verbatim for the agent to run
- * itself; we merely backstop the gate-required names the caller lacks. When the
- * model emits one of our backstop names we execute it and feed the result back
- * into the conversation, internally looping with upstream until the model either
- * emits an agent-executable tool_call or produces a final answer. The agent only
- * ever receives tool_calls it can actually run.
+ * The upstream only accepts stream:true, so we always request streaming
+ * upstream. When the agent asked for `stream:false` we collect the upstream SSE
+ * and resolve a single shaped completion object.
  *
  * Returns an async generator of OpenAI streaming chunks when stream=true, or a
  * single shaped completion object when stream=false.
@@ -70,13 +67,6 @@ export async function* relayChatCompletions(opts) {
   } = opts
 
   const clientToolNames = callerToolNames(tools)
-  // Proxy-executed fingerprint set = fingerprint names minus what the caller
-  // already registered. The caller's own tools stay its responsibility; the
-  // proxy only backstops the names the gate requires but the caller lacks
-  // (e.g. pi-agent has bash/grep/read but no glob).
-  const serverToolNames = new Set(
-    [...FINGERPRINT_TOOL_NAMES].filter((n) => !clientToolNames.has(n)),
-  )
   const baseBody = buildRequestBody({
     model, messages, system, tools,
     maxTokens: maxTokens || DEFAULT_MAX_TOKENS,
@@ -134,23 +124,19 @@ export async function* relayChatCompletions(opts) {
     const ctype = response.headers.get('content-type') || ''
     const estimateInput = () => JSON.stringify(wireMessages)
 
-    // Non-streaming for the agent: upstream is always SSE, so aggregate it,
-    // running any fingerprint tool calls server-side (so the agent never sees a
-    // tool it cannot execute). We keep the running wire conversation in a local
-    // variable so the server-side loop can re-feed tool results.
+    // Aggregate the upstream SSE into a single completion, rewriting any
+    // fingerprint tool_call the agent cannot run into an agent-supported tool
+    // (so the agent executes it itself). The agent never receives a tool name it
+    // cannot run; the proxy never executes anything.
     if (!stream) {
-      const finalCompletion = await runServerSideLoop(response, opts, wireMessages, wireTools, serverToolNames)
+      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames)
       yield finalCompletion
       return
     }
 
     if (ctype.includes('event-stream')) {
-      // Streaming: forward upstream SSE while intercepting fingerprint tool
-      // calls. We buffer each assistant turn; whenever the model emits a
-      // fingerprint-only tool call we execute it server-side and re-feed the
-      // conversation to upstream, splicing the synthetic tool results into the
-      // stream the agent sees. Agent-executable tool calls are forwarded as-is.
-      yield* translateStreamWithServerTools(response, opts, wireMessages, wireTools, serverToolNames)
+      const finalCompletion = await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames)
+      if (finalCompletion) yield* completionToChunks(finalCompletion)
       return
     }
 
@@ -164,107 +150,89 @@ export async function* relayChatCompletions(opts) {
 }
 
 /**
- * Core loop shared by both streaming and non-streaming paths.
+ * Aggregate upstream SSE responses and rewrite any fingerprint tool_call the
+ * agent cannot run into an agent-supported tool. Returns the completion object
+ * that the proxy hands to the agent (standard OpenAI shape). The proxy NEVER
+ * executes tools: translation is purely a rewrite of tool_call names/args, and
+ * the agent runs the rewritten calls in ITS OWN working directory.
  *
- * Consumes an upstream SSE response, aggregates it into a completion object, and
- * runs any fingerprint tool calls the proxy owns (bash/glob/grep/read) server-
- * side, re-feeding the conversation to upstream until the model either returns
- * only agent-executable tool_calls or a final answer. Returns the final
- * aggregated completion object. `onTurn` is invoked once per completed turn with
- * the aggregated completion so the streaming path can emit it.
+ * Agent-executable tool_calls (names the caller registered) are forwarded
+ * verbatim. Fingerprint tool_calls the agent does NOT implement are translated
+ * via translateFingerprintCall (e.g. `glob` -> `bash` with a globstar loop). If
+ * no registered tool can stand in for a fingerprint call, the proxy records a
+ * textual note and re-queries upstream (a pure relay — no shell/filesystem
+ * execution) until the model yields either real agent work or a final answer.
  */
-async function runServerSideLoop(firstResponse, opts, wireMessages, wireTools, serverToolNames, onTurn) {
+async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames) {
   const { model, maxTokens, temperature, topP, timeoutMs } = opts
   let wire = [...wireMessages]
-  const maxServerTurns = 4
-  let lastCompletion = null
+  let response = firstResponse
 
-  for (let turn = 0; turn < maxServerTurns; turn++) {
-    const response = turn === 0 ? firstResponse : await fetch(`${getOpencodeBase()}/chat/completions`, {
-      method: 'POST', headers: fingerprintHeaders(),
-      body: JSON.stringify(buildWireBody({
-        model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
-      })),
-      signal: AbortSignal.timeout(timeoutMs || 60000),
-    })
-    if (!response.ok && turn > 0) break
+  for (let turn = 0; turn < 4; turn++) {
     const completion = await aggregateSse(response, model, () => JSON.stringify(wire))
-    lastCompletion = completion
-    const tcs = completion.choices?.[0]?.message?.tool_calls || []
-    if (tcs.length === 0) {
-      onTurn?.(completion)
-      return completion
-    }
+    const msg = completion.choices?.[0]?.message || {}
+    const tcs = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
+    if (tcs.length === 0) return completion
 
-    // Partition: server-owned fingerprint tools vs. agent-executable tools.
-    const serverCalls = tcs.filter((tc) => serverToolNames.has(tc.function?.name))
-    const agentCalls = tcs.filter((tc) => !serverToolNames.has(tc.function?.name))
-
-    // Append the assistant message to the running conversation (keep it verbatim
-    // for upstream fidelity, including any proxy-owned tool calls).
-    const assistantMsg = completion.choices[0].message
-    if (assistantMsg.content === '' && assistantMsg.tool_calls) assistantMsg.content = null
-    wire = [...wire, assistantMsg]
-
-    if (serverCalls.length === 0) {
-      // Every tool call is for the agent: forward verbatim and stop looping.
-      onTurn?.(completion)
-      return completion
-    }
-
-    // Execute the proxy-owned tools and feed their results back into the
-    // conversation so the model can continue.
-    const toolResults = await Promise.all(
-      serverCalls.map(async (tc) => {
+    const agentCalls = []
+    const translatedCalls = [] // real agent tools produced from fingerprint calls
+    const noteResults = [] // textual stand-ins when no agent tool can stand in
+    for (const tc of tcs) {
+      const name = tc.function?.name
+      if (clientToolNames.has(name)) {
+        agentCalls.push(tc) // agent runs it itself; forward verbatim
+      } else if (isFingerprintTool(name)) {
         let args = {}
         try { args = JSON.parse(tc.function?.arguments || '{}') } catch { /* ignore */ }
-        const res = await executeFingerprintTool(tc.function?.name, args, opts.cwd, opts.signal)
-        return {
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: res ? res.content : `Error: cannot run tool ${tc.function?.name}`,
+        const tr = translateFingerprintCall(name, args, clientToolNames)
+        if (tr) {
+          translatedCalls.push({
+            id: encodeTranslatedId(tc.id, name, tc.function?.arguments || '{}'),
+            type: 'function',
+            function: { name: tr.name, arguments: JSON.stringify(tr.arguments) },
+          })
+        } else {
+          // Nothing in the agent's toolset can stand in; give the model a textual
+          // result directly (pure relay, not execution) and continue the loop.
+          noteResults.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: `The tool "${name}" is not available in your environment; no result provided.`,
+          })
         }
-      }),
-    )
-    wire = [...wire, ...toolResults]
-
-    if (agentCalls.length > 0) {
-      // Mixed turn: the agent must run some tools, but it must never receive a
-      // proxy-owned tool name (it would report "Tool <name> not found"). Forward
-      // a copy of this turn that keeps ONLY the agent-executable tool calls, then
-      // hand control to the agent. The proxy-owned calls are already resolved
-      // internally for the next request the agent makes.
-      const filtered = {
-        ...completion,
-        choices: [{
-          ...completion.choices[0],
-          message: {
-            ...completion.choices[0].message,
-            tool_calls: agentCalls,
-          },
-        }],
+      } else {
+        agentCalls.push(tc) // unknown tool registered by a different name; forward
       }
-      onTurn?.(filtered)
-      return filtered
     }
-    // Pure proxy-owned turn: continue the loop with the enriched conversation.
-  }
-  return lastCompletion
-}
 
-/**
- * Streaming path: run the server-side loop and replay each resolved turn as a
- * faithful OpenAI SSE stream. Proxy-executed fingerprint tool calls are already
- * folded into the model's final answer, so the agent only sees tool_calls it can
- * actually run (its own tools).
- */
-async function* translateStreamWithServerTools(response, opts, wireMessages, wireTools, serverToolNames) {
-  const finalCompletion = await runServerSideLoop(response, opts, wireMessages, wireTools, serverToolNames, (completion) => {
-    // For streaming we already forwarded earlier turns inside the loop? No — we
-    // replay the FINAL completion only, because the proxy-owned turns are
-    // internal. If the model's last turn is agent-only, that is what we forward.
-  })
-  if (finalCompletion) yield* completionToChunks(finalCompletion)
+    if (noteResults.length) {
+      // Feed the textual notes back to upstream and continue; the model either
+      // stops or emits real (agent-executable) tool calls on the next turn.
+      const assistantMsg = { ...msg, content: msg.content || null }
+      wire = [...wire, assistantMsg, ...noteResults]
+      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+        method: 'POST', headers: fingerprintHeaders(),
+        body: JSON.stringify(buildWireBody({
+          model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
+        })),
+        signal: AbortSignal.timeout(timeoutMs || 60000),
+      })
+      continue
+    }
+
+    if (agentCalls.length === 0 && translatedCalls.length === 0) return completion
+
+    const agentMsg = {
+      ...msg,
+      content: msg.content || null,
+      tool_calls: [...agentCalls, ...translatedCalls],
+    }
+    return {
+      ...completion,
+      choices: [{ ...completion.choices[0], message: agentMsg, finish_reason: 'tool_calls' }],
+    }
+  }
+  return completion
 }
 
 // Convert an aggregated completion object into OpenAI streaming chunks so the
