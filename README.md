@@ -123,16 +123,23 @@ fingerprint described above.
 > `edit`/`write` but **no `glob`**, and historically its `bash` is not wired through
 > custom OpenAI providers. Because the gate *forces* all four names to be
 > advertised, the model may call one the client cannot resolve, and the client
-> would report `Tool not found`. To avoid that, the proxy **executes ALL four
-> fingerprint tools server-side** (`executeFingerprintTool` in `src/conversions.js`,
-> wired through `runServerSideLoop` in `src/upstream.js`) on **both streaming and
-> non-streaming paths**, feeds the result back to the model as a synthetic tool
-> message, and loops with upstream until the model emits only agent-executable
-> tool calls or a final answer. **The agent never receives a tool_call with a
-> fingerprint name**, so it can never report `Tool not found`. The agent's own
-> registered tools (`ls`/`find`/`edit`/`write`/…) are always forwarded verbatim.
-> The server-side implementations use only Node builtins (glob/grep via `node:fs`,
-> bash via `node:child_process`) — no extra dependencies.
+> would report `Tool not found`. The proxy keeps all four names on the wire (the
+> gate requires them) but only **executes server-side the ones the caller did NOT
+> register** — its backstop set is `fingerprint names − caller tool names`
+> (`serverToolNames` in `src/upstream.js`, computed per request via
+> `callerToolNames`). Registered caller tools are forwarded verbatim for the agent
+> to run itself; the proxy only runs the gate-required names the caller lacks
+> (e.g. pi-agent lacks `glob`, so the proxy runs just `glob`). Whichever it runs,
+> `executeFingerprintTool` (`src/conversions.js`, wired through `runServerSideLoop`
+> in `src/upstream.js`) applies on **both streaming and non-streaming paths**; the
+> result is fed back as a synthetic tool message and the proxy loops with upstream
+> until the model emits only agent-executable tool calls or a final answer.
+> **The agent never receives a tool_call whose name is in the proxy's backstop
+> set**, so it can never report `Tool not found`. The agent's own registered tools
+> (`ls`/`find`/`edit`/`write`/… and any of `bash`/`glob`/`grep`/`read` it provides)
+> are always forwarded verbatim. The server-side implementations use only Node
+> builtins (glob/grep via `node:fs`, bash via `node:child_process`) — no extra
+> dependencies.
 
 ## License
 
