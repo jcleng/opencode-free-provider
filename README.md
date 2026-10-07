@@ -43,12 +43,41 @@ Env overrides:
 | `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | Point the relay elsewhere (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call, safest) or `sticky` (reuse one for the process) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | When `sticky`, rotate the session every N seconds |
+| `https_proxy` / `HTTPS_PROXY` | _(unset)_ | Outbound HTTPS proxy for reaching `opencode.ai`. Requires `NODE_USE_ENV_PROXY=1` (see below) |
+| `NODE_USE_ENV_PROXY` | _(unset)_ | Set to `1` to make the built-in `fetch` honor `https_proxy`/`HTTPS_PROXY` |
 
 Debug endpoint (local only, never forwarded upstream):
 
 ```bash
 curl http://127.0.0.1:8791/__session
 ```
+
+## Outbound proxy (reaching opencode.ai)
+
+The relay itself is a plain HTTP server on `127.0.0.1:8791`; the **outbound**
+request it makes to `https://opencode.ai/zen/v1` uses Node's built-in global
+`fetch` (undici). That `fetch` does **not** read `https_proxy`/`HTTPS_PROXY` by
+default — you must opt in.
+
+To send the upstream traffic through an HTTP proxy (e.g. `http://127.0.0.1:20171`):
+
+```bash
+export https_proxy=http://127.0.0.1:20171
+export HTTPS_PROXY=http://127.0.0.1:20171   # case-insensitive; both are read
+export NODE_USE_ENV_PROXY=1                 # REQUIRED: makes global fetch honor the proxy
+node server.js
+```
+
+`NODE_USE_ENV_PROXY=1` is the critical flag — without it, merely exporting
+`https_proxy` has **no effect** and the relay connects to `opencode.ai`
+directly. (Verified on Node ≥ 24: `fetch` only consults `https_proxy`/`HTTPS_PROXY`
+when this flag is set, and emits a `CONNECT` tunnel to the proxy.)
+
+> Note: the proxy at `127.0.0.1:20171` must support the `CONNECT` tunnel method
+> for HTTPS upstreams. If you prefer to pin the proxy in code (independent of the
+> `NODE_USE_ENV_PROXY` experimental switch and Node version), configure an undici
+> `ProxyAgent` via `setGlobalDispatcher` in `src/upstream.js` and pass it as the
+> `dispatcher` on each `fetch`.
 
 ## Connect an agent
 
