@@ -6,6 +6,7 @@ import {
 import {
   buildRequestBody, buildWireBody, parseSse, translateStream,
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
+  normalizeToolArguments,
 } from './conversions.js'
 
 function resolveApiKey() {
@@ -326,6 +327,14 @@ async function aggregateSse(response, model, estimateInput) {
         if (tc.function?.arguments) block.function.arguments += tc.function.arguments
       }
     }
+  }
+
+  // Sanitize aggregated tool-call arguments before the message is either handed
+  // to the agent or re-sent upstream. When the upstream stream is truncated
+  // (network glitch) an arguments fragment can be empty/invalid; OpenCode Zen
+  // rejects that with HTTP 400 "function.arguments must be a JSON object".
+  for (const block of toolCalls.values()) {
+    block.function.arguments = normalizeToolArguments(block.function.arguments)
   }
 
   const message = { role: 'assistant', content: content.join('') }

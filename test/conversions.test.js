@@ -13,6 +13,7 @@ import {
   translateFingerprintCall,
   encodeTranslatedId,
   decodeTranslatedId,
+  normalizeToolArguments,
 } from '../src/conversions.js'
 import { isFingerprintTool } from '../src/config.js'
 import { splitModelId, findModel, isValidModel, listModelsPayload } from '../src/models.js'
@@ -242,4 +243,38 @@ test('isFingerprintTool identifies the gate-required names', function () {
   assert.equal(isFingerprintTool('read'), true)
   assert.equal(isFingerprintTool('grep'), true)
   assert.equal(isFingerprintTool('weirdtool'), false)
+})
+
+test('normalizeToolArguments keeps valid JSON object strings', function () {
+  assert.equal(normalizeToolArguments('{"x":1}'), '{"x":1}')
+})
+
+test('normalizeToolArguments falls back to {} for empty/whitespace', function () {
+  assert.equal(normalizeToolArguments(''), '{}')
+  assert.equal(normalizeToolArguments('   '), '{}')
+  assert.equal(normalizeToolArguments(undefined), '{}')
+})
+
+test('normalizeToolArguments falls back to {} for malformed JSON', function () {
+  assert.equal(normalizeToolArguments('{not json'), '{}')
+  assert.equal(normalizeToolArguments('{"x":'), '{}')
+})
+
+test('normalizeToolArguments falls back to {} for non-object JSON', function () {
+  assert.equal(normalizeToolArguments('[1,2,3]'), '{}')
+  assert.equal(normalizeToolArguments('"hi"'), '{}')
+  assert.equal(normalizeToolArguments('42'), '{}')
+  assert.equal(normalizeToolArguments('null'), '{}')
+})
+
+test('normalizeToolArguments stringifies object args', function () {
+  assert.equal(normalizeToolArguments({ command: 'ls' }), '{"command":"ls"}')
+})
+
+test('serializeMessages normalizes malformed tool-call arguments to {}', function () {
+  const wire = serializeMessages([{
+    role: 'assistant',
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '' } }],
+  }])
+  assert.equal(wire[0].tool_calls[0].function.arguments, '{}')
 })

@@ -14,6 +14,51 @@ function blocksOf(content, type) {
   return Array.isArray(content) ? content.filter((b) => b.type === type) : []
 }
 
+// ---------------------------------------------------------------------------
+// Tool-call arguments normalization
+// ---------------------------------------------------------------------------
+// OpenCode Zen (upstream free tier) REJECTS a request with HTTP 400
+// "Assistant tool call function.arguments must be a JSON object." if any
+// assistant tool_call's `function.arguments` is not a stringified JSON *object*
+// (e.g. empty string, array, primitive, null, or malformed JSON). Since this
+// proxy forwards client/agent tool_calls verbatim and also re-sends aggregated
+// upstream responses, a single bad arguments value (commonly an empty or
+// truncated stream fragment) breaks the whole request.
+//
+// normalizeToolArguments forces ANY value into a valid JSON-object string:
+//   - string: parse it; if it is a JSON object string, keep it; otherwise '{}'
+//   - object (non-array, non-null): JSON.stringify it
+//   - anything else (array / primitive / null / undefined): '{}'
+//
+// '{}' is the safe fallback: it satisfies the upstream contract and most tools
+// tolerate an empty object better than a 400 that kills the whole turn.
+export function normalizeToolArguments(args) {
+  if (typeof args === 'string') {
+    const s = args.trim()
+    if (s === '') return '{}'
+    try {
+      const parsed = JSON.parse(s)
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return s
+      return '{}'
+    } catch {
+      return '{}'
+    }
+  }
+  if (args !== null && typeof args === 'object' && !Array.isArray(args)) {
+    return JSON.stringify(args)
+  }
+  return '{}'
+}
+
+// Normalize a single tool_call's function.arguments in place-safe fashion.
+function normalizeToolCall(tc) {
+  const fn = tc?.function || {}
+  return {
+    ...tc,
+    function: { ...fn, arguments: normalizeToolArguments(fn.arguments) },
+  }
+}
+
 // OpenAI messages → OpenAI messages. We only need to normalize non-standard
 // agent content blocks (reasoning / tool-call / tool-result) into the standard
 // text / tool_calls / tool roles that OpenCode Zen understands.
@@ -36,7 +81,9 @@ export function serializeMessages(messages, systemPrompt) {
         ...blocksOf(m.content, 'tool-call').map((b) => ({
           id: b.id, type: 'function', function: { name: b.name, arguments: b.arguments },
         })),
-      ].map(restoreTranslatedToolCall)
+      ]
+        .map(restoreTranslatedToolCall)
+        .map(normalizeToolCall)
       const msg = { role: 'assistant', content: text }
       if (reasoning) msg.reasoning_content = reasoning
       if (toolCalls.length) msg.tool_calls = toolCalls
