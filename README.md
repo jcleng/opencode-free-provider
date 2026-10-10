@@ -43,6 +43,8 @@ Env overrides:
 | `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | Point the relay elsewhere (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call, safest) or `sticky` (reuse one for the process) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | When `sticky`, rotate the session every N seconds |
+| `ZEN_MODELS_TTL_SECONDS` | `600` | How long (seconds) the discovered model list is cached before re-fetching from upstream (`0` = never expire) |
+| `ZEN_MODELS_TIMEOUT_MS` | `5000` | Timeout for the upstream `GET /models` discovery request |
 | `https_proxy` / `HTTPS_PROXY` | _(unset)_ | Outbound HTTPS proxy for reaching `opencode.ai`. Requires `NODE_USE_ENV_PROXY=1` (see below) |
 | `NODE_USE_ENV_PROXY` | _(unset)_ | Set to `1` to make the built-in `fetch` honor `https_proxy`/`HTTPS_PROXY` |
 
@@ -50,6 +52,7 @@ Debug endpoint (local only, never forwarded upstream):
 
 ```bash
 curl http://127.0.0.1:8791/__session
+curl http://127.0.0.1:8791/__models          # model-registry cache status (?refresh=1 forces re-fetch)
 ```
 
 ## Outbound proxy (reaching opencode.ai)
@@ -144,16 +147,23 @@ PI Agent example:
   (`stream:false`, aggregated from upstream SSE by this proxy)
 - `GET /health`, `/` — health text
 - `GET /__session` — local fingerprint/session status
+- `GET /__models` — local model-registry cache status (`?refresh=1` forces a re-fetch)
 
 ## Models
 
-Only `big-pickle` is enabled for now (see `MODELS` in `src/config.js`). Each model
-must be verified live against the free tier before being added back.
+The model list is **discovered live**: on startup (and whenever the cache is
+stale) the proxy calls
+`curl https://opencode.ai/zen/v1/models` (via `GET {OPENCODE_BASE}/models` in
+`src/config.js`) and keeps only the ids whose id contains `big-pickle` **or**
+contains `-free` — everything else (claude/gpt/gemini/… ids on the upstream list)
+is filtered out. The result is cached for `ZEN_MODELS_TTL_SECONDS` (default 600s);
+on a fetch failure the last good list is kept (before the first success the
+built-in fallback is `big-pickle`).
 
 ## Test
 
 ```bash
-npm test             # 38 unit tests (mock upstream)
+npm test             # 47 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the

@@ -41,9 +41,9 @@ This proxy injects every required header/field, so plain OpenAI clients just wor
 | File | Responsibility |
 |---|---|
 | `server.js` | HTTP server, routing, `/__session` debug endpoint, direct-run guard |
-| `src/routes.js` | `/v1/models`, `/v1/models/:id`, `/v1/chat/completions`, `/__session` |
+| `src/routes.js` | `/v1/models`, `/v1/models/:id`, `/v1/chat/completions`, `/__session`, `/__models` |
 | `src/models.js` | Local model registry + `opencode-free/` id prefix handling |
-| `src/config.js` | **Fingerprint source of truth**: UA, session/request id generation, mandatory tools, env overrides |
+| `src/config.js` | **Fingerprint + model registry source of truth**: UA, session/request id generation, mandatory tools, env overrides, **live model discovery (`GET /models` → filter ids containing `big-pickle` or `-free`) with TTL cache** |
 | `src/conversions.js` | OpenAI↔upstream normalization; `buildRequestBody` forces `stream:true` + injects the 4 tools; SSE aggregation for non-stream |
 | `src/upstream.js` | **Request injection + relay**: builds fingerprint headers, POSTs upstream, aggregates SSE→JSON for non-stream |
 
@@ -121,10 +121,13 @@ node server.js
 | `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | redirect relay (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call) or `sticky` (reuse one) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | when `sticky`, rotate session every N seconds |
+| `ZEN_MODELS_TTL_SECONDS` | `600` | model-list cache TTL in seconds (`0` = never expire) |
+| `ZEN_MODELS_TIMEOUT_MS` | `5000` | timeout for the upstream model-discovery fetch |
 
 Local debug (never forwarded upstream):
 ```bash
 curl http://127.0.0.1:8791/__session
+curl http://127.0.0.1:8791/__models      # ?refresh=1 forces a re-fetch
 ```
 
 ## Connect an agent
@@ -149,7 +152,7 @@ no translation at all.
 ## Test / validate
 
 ```bash
-npm test                 # 38 unit tests against a MOCK upstream (no network)
+npm test                 # 47 unit tests against a MOCK upstream (no network)
 ```
 
 Live end-to-end against the real free tier (expect 200 + SSE / aggregated JSON):
@@ -168,6 +171,19 @@ curl -H 'Authorization: Bearer public' -H 'Content-Type: application/json' \
 
 ## Models
 
-Only `big-pickle` is enabled (see `MODELS` in `src/config.js`). Each model must be
-verified live against the free tier before being added back. Note `big-pickle` is
-served by the free tier even though it is not a `*-free`-suffixed model.
+The registry is **discovered at runtime**, not hard-coded: `refreshModels()` in
+`src/config.js` fetches `GET {OPENCODE_BASE}/models` (i.e.
+`https://opencode.ai/zen/v1/models`, same fingerprint UA + `Bearer public` as the
+relay) and keeps only entries whose id contains `big-pickle` **or** contains
+`-free`. Everything else on the upstream list (claude/gpt/gemini/grok/…) is
+filtered out — the free gateway rejects those anyway.
+
+- `getModels()` is the synchronous accessor used by `src/models.js` (routes stay
+  sync-shaped); `ensureModels()` refreshes when the TTL (`ZEN_MODELS_TTL_SECONDS`,
+  default 600s) expires and never throws — on failure the last good list (or
+  `DEFAULT_MODELS` = `big-pickle` before the first success) is served.
+- `filterModels()` / `normalizeModel()` are exported for tests.
+- `GET /__models` reports the cache state (`source`, `ids`, `ageSeconds`,
+  `error`); `?refresh=1` forces a re-fetch.
+- `big-pickle` qualifies via the first clause even though it is not
+  `*-free`-suffixed.

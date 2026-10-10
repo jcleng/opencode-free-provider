@@ -24,3 +24,27 @@ test('currentSession returns a valid session id per-request by default', () => {
   assert.match(a, /^ses_[0-9a-f]{26}$/)
   assert.notEqual(a, b, 'per-request mode yields a fresh session each call')
 })
+
+test('filterModels keeps only big-pickle / *-free ids', async () => {
+  const { filterModels } = await import('../src/config.js')
+  const models = filterModels({
+    object: 'list',
+    data: [
+      { id: 'big-pickle' },
+      { id: 'jev-1.13-free' },
+      { id: 'muse-spark-1.3-contributor-free' },
+      { id: 'claude-opus-5' },
+      { id: 'gpt-5.5' },
+      { id: 'gemini-3-flash' },
+      { id: 'jev-1.13-free' }, // duplicate
+    ],
+  })
+  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'jev-1.13-free', 'muse-spark-1.3-contributor-free'])
+  assert.ok(models.every((m) => m.name && m.contextWindow > 0))
+})
+
+test('filterModels accepts a bare array and tolerates junk', async () => {
+  const { filterModels } = await import('../src/config.js')
+  assert.deepEqual(filterModels(['big-pickle', 'nope', null, 42]).map((m) => m.id), ['big-pickle'])
+  assert.deepEqual(filterModels(null), [])
+})

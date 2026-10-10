@@ -1,4 +1,4 @@
-import { PROVIDER, sessionState } from './config.js'
+import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState } from './config.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
 
@@ -31,7 +31,17 @@ function readBody(req, limit = 20 * 1024 * 1024) {
 }
 
 export async function handleModels(req, res) {
+  // Refresh from upstream when the cached list is stale (best-effort: on
+  // failure the previous list is served).
+  await ensureModels()
   return sendJson(res, 200, listModelsPayload())
+}
+
+// Local debug endpoint (never forwarded upstream). Reports the discovered
+// model registry and its cache state.
+export async function handleModelsInfo(req, res, url) {
+  if (url && url.searchParams.get('refresh') === '1') await refreshModels()
+  return sendJson(res, 200, { provider: PROVIDER, ...modelsCacheState() })
 }
 
 // Local debug endpoint (never forwarded upstream). Reports the current
@@ -40,7 +50,8 @@ export function handleSessionInfo(req, res) {
   return sendJson(res, 200, { provider: PROVIDER, ...sessionState() })
 }
 
-export function handleModel(req, res, id) {
+export async function handleModel(req, res, id) {
+  await ensureModels()
   if (isValidModel(id)) {
     const m = findModel(id)
     return sendJson(res, 200, {
@@ -74,6 +85,10 @@ export async function handleChatCompletions(req, res) {
   } catch {
     return sendJson(res, 400, openaiError(400, 'Invalid JSON in request body', 'invalid_request_error').body)
   }
+
+  // Make sure the discovered model list is fresh before validating, so a model
+  // that just appeared upstream (or a cold start) is not rejected.
+  await ensureModels()
 
   const requested = parsed.model
   if (!requested || typeof requested !== 'string') {

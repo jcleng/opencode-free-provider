@@ -15,6 +15,20 @@ function startUpstream() {
       req.on('data', (c) => (body += c))
       req.on('end', () => {
         lastUpstreamReq = { method: req.method, url: req.url, auth: req.headers['authorization'], ua: req.headers['user-agent'], body }
+        if (req.method === 'GET' && req.url.endsWith('/models')) {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            object: 'list',
+            data: [
+              { id: 'big-pickle', object: 'model', created: 0, owned_by: 'opencode' },
+              { id: 'jev-1.13-free', object: 'model', created: 0, owned_by: 'opencode' },
+              { id: 'nemotron-3-ultra-free', object: 'model', created: 0, owned_by: 'opencode' },
+              { id: 'claude-opus-5', object: 'model', created: 0, owned_by: 'opencode' },
+              { id: 'gpt-5.5', object: 'model', created: 0, owned_by: 'opencode' },
+            ],
+          }))
+          return
+        }
         if (failWith) {
           res.writeHead(failWith.status, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ error: failWith.error }))
@@ -69,6 +83,21 @@ test('/v1/models returns openai-style list', async () => {
   const json = await res.json()
   assert.equal(json.object, 'list')
   assert.ok(json.data.some((m) => m.id === `${PROVIDER}/big-pickle`))
+  // ids discovered from upstream and filtered to `big-pickle` / `*-free` only
+  assert.ok(json.data.some((m) => m.id === `${PROVIDER}/jev-1.13-free`))
+  assert.ok(json.data.some((m) => m.id === `${PROVIDER}/nemotron-3-ultra-free`))
+  assert.ok(!json.data.some((m) => m.id === `${PROVIDER}/claude-opus-5`))
+  assert.ok(!json.data.some((m) => m.id === `${PROVIDER}/gpt-5.5`))
+})
+
+test('/__models reports the discovered registry cache', async () => {
+  const res = await fetchProxy('/__models')
+  assert.equal(res.status, 200)
+  const json = await res.json()
+  assert.equal(json.source, 'upstream')
+  assert.ok(json.ids.includes('big-pickle'))
+  assert.ok(json.ids.includes('jev-1.13-free'))
+  assert.ok(!json.ids.includes('claude-opus-5'))
 })
 
 test('/v1/models/:id for known model', async () => {

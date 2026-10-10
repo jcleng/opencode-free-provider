@@ -1,4 +1,4 @@
-import { MODELS, PROVIDER } from './config.js'
+import { getModels, PROVIDER } from './config.js'
 
 // Split "provider/model" → { provider, model }. OpenAI ids are a single
 // token, so an id without a slash is treated as a bare model id.
@@ -11,10 +11,12 @@ export function splitModelId(id) {
 
 // Build the OpenAI-style model listing. id === `${PROVIDER}/${m.id}` so an
 // agent can pass either "opencode-free/hy3-free" or just "hy3-free".
+// The registry is populated live from the upstream /models endpoint (see
+// getModels/refreshModels in config.js).
 export function listModelsPayload() {
   return {
     object: 'list',
-    data: MODELS.map((m) => ({
+    data: getModels().map((m) => ({
       id: `${PROVIDER}/${m.id}`,
       object: 'model',
       created: 0,
@@ -28,7 +30,7 @@ export function listModelsPayload() {
 
 export function findModel(modelId) {
   const { model } = splitModelId(modelId)
-  return MODELS.find((m) => m.id === model) || null
+  return getModels().find((m) => m.id === model) || null
 }
 
 export function isValidModel(modelId) {

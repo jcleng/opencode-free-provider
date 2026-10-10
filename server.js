@@ -21,7 +21,7 @@
 
 import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
@@ -61,7 +61,7 @@ const server = http.createServer(async (req, res) => {
     // /v1/models/:id  (id may contain slashes, e.g. opencode-free/hy3-free)
     const modelMatch = path.match(/^\/v1\/models\/(.+)$/)
     if (method === 'GET' && modelMatch) {
-      return handleModel(req, res, decodeURIComponent(modelMatch[1]))
+      return await handleModel(req, res, decodeURIComponent(modelMatch[1]))
     }
 
     // /v1/chat/completions
@@ -72,6 +72,11 @@ const server = http.createServer(async (req, res) => {
     // /__session — local debug endpoint (never forwarded upstream).
     if (method === 'GET' && path === '/__session') {
       return handleSessionInfo(req, res)
+    }
+
+    // /__models — local model-registry cache status (add ?refresh=1 to force).
+    if (method === 'GET' && path === '/__models') {
+      return await handleModelsInfo(req, res, url)
     }
 
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })
