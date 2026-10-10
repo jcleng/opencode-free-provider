@@ -1,6 +1,11 @@
 # OpenCode Zen free-tier proxy — minimal, dependency-free Node image.
 # No npm install needed (zero runtime deps); just ship the ESM sources.
-FROM node:20-alpine
+#
+# Node >= 24 is REQUIRED: the built-in global `fetch` only honors the
+# `https_proxy`/`HTTPS_PROXY` env vars (via `NODE_USE_ENV_PROXY=1`) starting in
+# Node v24.0.0. On node:20-alpine the flag is silently ignored and outbound
+# traffic bypasses the proxy entirely. See README "Outbound proxy".
+FROM node:24-alpine
 
 WORKDIR /app
 

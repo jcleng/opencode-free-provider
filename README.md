@@ -73,6 +73,25 @@ node server.js
 directly. (Verified on Node ≥ 24: `fetch` only consults `https_proxy`/`HTTPS_PROXY`
 when this flag is set, and emits a `CONNECT` tunnel to the proxy.)
 
+> **Requires Node ≥ 24.** `NODE_USE_ENV_PROXY` was added in **Node v24.0.0**.
+> On Node 18/20/22 the flag is silently ignored, so the relay keeps connecting
+> to `opencode.ai` directly even though `https_proxy` is set and the container
+> env looks correct. The bundled `Dockerfile` therefore builds on
+> `node:24-alpine`. To check a running container:
+>
+> ```bash
+> docker exec opencode-free-provider node -v        # expect v24.x or newer
+> ```
+>
+> Quick litmus test — point `https_proxy` at a dead port; with the flag on the
+> fetch **must** fail with `ECONNREFUSED`. If it succeeds, the proxy is being
+> bypassed (wrong Node version, or the env vars never reached the process):
+>
+> ```bash
+> NODE_USE_ENV_PROXY=1 https_proxy=http://127.0.0.1:39999 node -e \
+>   'fetch("https://example.com").then(r=>console.log("DIRECT",r.status)).catch(e=>console.log("PROXIED ->",e.cause?.code))'
+> ```
+
 > Note: the proxy at `127.0.0.1:20171` must support the `CONNECT` tunnel method
 > for HTTPS upstreams. If you prefer to pin the proxy in code (independent of the
 > `NODE_USE_ENV_PROXY` experimental switch and Node version), configure an undici
