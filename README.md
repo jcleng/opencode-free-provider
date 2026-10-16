@@ -79,7 +79,61 @@ Debug endpoint (local only, never forwarded upstream):
 ```bash
 curl http://127.0.0.1:8791/__session
 curl http://127.0.0.1:8791/__models          # model-registry cache status (?refresh=1 forces re-fetch)
+curl http://127.0.0.1:8791/__pool            # egress-pool status (?refresh=1 forces a vet cycle)
 ```
+
+### Egress proxy pool (per-IP quota, bypassed)
+
+OpenCode Zen spends a rate budget on the request's **egress IP**: once your
+address is spent, it answers `429 FreeUsageLimitError` with a `retry-after`
+measured in hours, regardless of how fresh the session id is. The proxy keeps
+a **self-contained pool of verified egress addresses** and rides one per
+conversation:
+
+- **Harvest** — candidates are pulled from a public proxy list (overridable),
+  screened by a real CONNECT tunnel, then **proven with a live zen pong** (full
+  fingerprint + gate tools + real SSE data). Only pongs faster than
+  `OFP_POOL_MAX_TTFB_MS` are kept, ranked fastest-first, persisted atomically
+  to its own pool file.
+- **Rotation** — a session pin keeps one address per conversation (so a chat
+  owns that address's quota instead of spraying the pool). A `429` cools **that
+  address** using the upstream's own `Retry-After` (clamped), and the request
+  retries on the next-fastest healthy candidate — all inside the same call,
+  invisible to the agent.
+- **Fall-back** — pool empty or disabled → plain direct fetch; behavior is
+  identical to a build without the pool module.
+
+Config (all optional; see `src/egress.js` for the full list):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OFP_POOL_ENABLED` | `1` | `0` restores the always-direct relay |
+| `OFP_POOL_FILE` | `~/.local/share/opencode-free-provider/egress-pool.json` | verified pool; atomic rename on save |
+| `OFP_POOL_MAX_TTFB_MS` | `4000` | egresses slower than this are discarded |
+| `OFP_POOL_MAX_ATTEMPTS` | `10` | address changes allowed per request |
+| `OFP_EGRESS_COOL_MAX_MS` | `7200000` | clamp for upstream `Retry-After` |
+| `OFP_POOL_SEED_TARGET` | `40` | harvest more candidates below this live count |
+
+Run a background harvester (one-shot or interval):
+
+```bash
+node scripts/poolkeeper.mjs --once   # single vet/harvest cycle, exit
+node scripts/poolkeeper.mjs          # loop (default 30m; POOL_INTERVAL_MIN overrides)
+```
+
+### Persistent install (survives restarts)
+
+`npm start` dies with your shell. To run a copy from a fixed install directory
+and keep it in sync with this repo:
+
+```bash
+npm run deploy                          # syncs repo -> ~/.local/share/opencode-free-provider, restarts, health-checks
+OFP_INSTALL_DIR=/other/path npm run deploy
+```
+
+Run `npm run deploy` after every `git pull` — an install copy predating
+`src/fingerprint.js` silently relays without a valid free-tier fingerprint and
+every request fails upstream with `403 FreeTierError`.
 
 ## Docker
 

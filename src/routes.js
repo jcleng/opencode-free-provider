@@ -2,6 +2,7 @@ import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState }
 import { fingerprintState } from './fingerprint.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
+import { poolState, refresh as poolRefresh } from './egress.js'
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj)
@@ -49,6 +50,24 @@ export async function handleModelsInfo(req, res, url) {
 // x-opencode-session mode/state so the operator can confirm the fingerprint.
 export function handleSessionInfo(req, res) {
   return sendJson(res, 200, { provider: PROVIDER, ...sessionState(), fingerprint: fingerprintState() })
+}
+
+// Local debug endpoint (never forwarded upstream). Reports the egress pool
+// (`?refresh=1` forces a vet/refresh cycle). Sessions always fall back to a
+// direct fetch when the pool is empty, so this is informational.
+export async function handlePoolInfo(req, res, url) {
+  if (url && url.searchParams.get('refresh') === '1') await poolRefresh({ force: true })
+  else void poolRefresh()
+  return sendJson(res, 200, { provider: PROVIDER, ...poolState() })
+}
+
+// One conversation should own one egress address's quota: pin the egress route
+// on the agent's opencode session id when present, else on the client socket.
+function egressKeyFor(req) {
+  return (
+    (typeof req.headers['x-opencode-session'] === 'string' && req.headers['x-opencode-session']) ||
+    `${req.socket.remoteAddress}:${req.socket.remotePort}`
+  )
 }
 
 export async function handleModel(req, res, id) {
@@ -109,6 +128,10 @@ export async function handleChatCompletions(req, res) {
   res.on('close', onClose)
 
   try {
+    // Warm the egress pool lazily (no-op it is already healthy; refresh rides
+    // on its own min-interval guard).
+    void poolRefresh()
+
     if (stream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -131,6 +154,7 @@ export async function handleChatCompletions(req, res) {
         topP: parsed.top_p,
         signal: clientAbort.signal,
         timeoutMs,
+        egressKey: egressKeyFor(req),
       })) {
         writeChunk(chunk)
       }
@@ -149,6 +173,7 @@ export async function handleChatCompletions(req, res) {
         topP: parsed.top_p,
         signal: clientAbort.signal,
         timeoutMs,
+        egressKey: egressKeyFor(req),
       })) {
         completion = obj
       }

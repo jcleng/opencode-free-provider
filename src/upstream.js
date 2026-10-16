@@ -7,6 +7,7 @@ import {
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
   normalizeToolArguments,
 } from './conversions.js'
+import { createRouteSend, POOL_ENABLED } from './egress.js'
 
 function resolveApiKey() {
   return process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_G_API_KEY || LITERAL_KEY
@@ -80,6 +81,11 @@ export async function* relayChatCompletions(opts) {
     temperature, stream: true, topP,
   })
 
+  // Egress routing: with the pool enabled every upstream call goes through a
+  // verified address (rotating on 429/failures); with it off, plain fetch.
+  const send = POOL_ENABLED ? createRouteSend(opts.egressKey) : globalThis.fetch
+  opts.send = send
+
   // The wire conversation we keep re-sending to upstream (starts as the request
   // body's messages; grows with assistant tool-call + tool-result messages).
   let wireMessages = baseBody.messages
@@ -100,7 +106,7 @@ export async function* relayChatCompletions(opts) {
       if (signal) signal.addEventListener('abort', onAbort)
 
       const body = { ...baseBody, messages: wireMessages }
-      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+      response = await send(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST',
         headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(body),
@@ -217,7 +223,7 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
       // stops or emits real (agent-executable) tool calls on the next turn.
       const assistantMsg = { ...msg, content: msg.content || null }
       wire = [...wire, assistantMsg, ...noteResults]
-      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+      response = await (opts.send || globalThis.fetch)(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST', headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(buildWireBody({
           model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,

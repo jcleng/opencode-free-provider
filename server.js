@@ -24,7 +24,7 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handlePoolInfo } from './src/routes.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
@@ -80,6 +80,12 @@ const server = http.createServer(async (req, res) => {
     // /__models — local model-registry cache status (add ?refresh=1 to force).
     if (method === 'GET' && path === '/__models') {
       return await handleModelsInfo(req, res, url)
+    }
+
+    // /__pool — local egress-pool status (never forwarded upstream).
+    // `?refresh=1` forces a vet/refresh cycle; bare call kicks a lazy refresh.
+    if (method === 'GET' && path === '/__pool') {
+      return await handlePoolInfo(req, res, url)
     }
 
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })
