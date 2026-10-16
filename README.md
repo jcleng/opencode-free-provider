@@ -81,6 +81,20 @@ curl http://127.0.0.1:8791/__session
 curl http://127.0.0.1:8791/__models          # model-registry cache status (?refresh=1 forces re-fetch)
 ```
 
+### Persistent install (survives restarts)
+
+`npm start` dies with your shell. To run a copy from a fixed install directory
+and keep it in sync with this repo:
+
+```bash
+npm run deploy                          # syncs repo -> ~/.local/share/opencode-free-provider, restarts, health-checks
+OFP_INSTALL_DIR=/other/path npm run deploy
+```
+
+Run `npm run deploy` after every `git pull` — an install copy predating
+`src/fingerprint.js` silently relays without a valid free-tier fingerprint and
+every request fails upstream with `403 FreeTierError`.
+
 ## Docker
 
 The image is a plain **Debian/glibc** Node base (`node:24-bookworm-slim`) — the

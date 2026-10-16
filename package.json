@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
+    "deploy": "bash scripts/deploy.sh",
     "test": "node --test test/*.test.js"
   },
   "engines": {
