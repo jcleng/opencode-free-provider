@@ -25,5 +25,8 @@
     "openai",
     "completions",
     "llm"
-  ]
+  ],
+  "dependencies": {
+    "undici": "^8.12.3"
+  }
 }

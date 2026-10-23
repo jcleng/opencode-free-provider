@@ -8,6 +8,11 @@ agent (OpenCode, rikkahub, etc.) at it and use the free models with no API key.
 Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (opencode.ai/zen/v1)
 ```
 
+The free tier quota is **per-IP**, so the proxy also runs an **egress pool**:
+fast HTTP proxies scraped from the web are kept in a verified pool, and when the
+direct connection (or the current proxy) hits `429 FreeUsageLimitError`, requests
+rotate to the next usable egress IP automatically.
+
 ## Why a proxy is needed
 
 `opencode.ai/zen/v1` enforces a **client-fingerprint gate**: a bare request is
@@ -65,7 +70,7 @@ Env overrides:
 |---|---|---|
 | `PORT` | `8791` | Listen port |
 | `HOST` | `127.0.0.1` | Bind host |
-| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | Point the relay elsewhere (used by tests) |
+| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/inference/v1` | Point the relay elsewhere (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call, safest) or `sticky` (reuse one for the process) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | When `sticky`, rotate the session every N seconds |
 | `ZEN_MODELS_TTL_SECONDS` | `600` | How long (seconds) the discovered model list is cached before re-fetching from upstream (`0` = never expire) |
@@ -162,6 +167,62 @@ when this flag is set, and emits a `CONNECT` tunnel to the proxy.)
 > `ProxyAgent` via `setGlobalDispatcher` in `src/upstream.js` and pass it as the
 > `dispatcher` on each `fetch`.
 
+## Egress IP pool (per-IP quota rotation)
+
+The free tier enforces a **per-IP daily usage limit**. When your outbound IP
+exhausts it, every request returns `429 FreeUsageLimitError` with a
+`retry-after` until the UTC midnight reset. `src/egress.js` automates around
+this:
+
+- **Web-scraped pool.** On startup and every sweep the proxy scrapes three
+  public sources and keeps only *fast, reachability-capable* HTTP proxies:
+  `geonode.com` (latency ≤ 500 ms, speed ≥ 800 KB/s, uptime ≥ 90 %), the
+  `monosans/proxy-list` GitHub list, and `free-proxy-list.net`
+  (**HTTPS/CONNECT-tunnel-capable** entries checked within the last 5 minutes
+  only).
+- **Verified before use.** Every candidate is probed with a real
+  `POST /chat/completions` through the proxy (using the genuine
+  `src/fingerprint.js` headers — a forged session id yields `403` and would
+  falsely poison the pool). Outcomes:
+  - `200` → `status: ok`, ranked by time-to-first-byte;
+  - `429` → **dustbinned until its `retry-after`** (the proxy's own egress IP
+    is quota-exhausted; it returns automatically at the reset);
+  - transport failure / other 4xx → **dustbinned dead** and re-tested after
+    30 minutes.
+- **Background sweep.** Every 3 minutes (20 s in busy mode when no usable IP
+  exists) up to 30 proxies are re-tested in parallel: untested candidates,
+  stale `ok` entries (re-verified every 10 min so the best-IP ranking stays
+  honest), and due dustbin entries.
+- **Fast rotation at request time.** The relay routes each turn through the
+  best verified proxy (or direct when the pool is empty). On a 429 the
+  exhausted proxy is dustbinned and the next one is picked immediately; when
+  the direct connection 429s the relay inline quick-probes up to 3 fresh
+  candidates so a working IP is found without waiting for the next sweep.
+  Successes/failures are fed back into the pool via `reportEgress`.
+
+State lives in two JSON files next to `server.js` (gitignored, recreated on
+start): `egress-pool.json` (live entries) and `egress-dustbin.json`
+(dead/quota-burned entries with their retest times).
+
+Debug endpoint:
+
+```bash
+curl http://127.0.0.1:8791/__egress
+# → poolSize / ok / untested / dustbin(quota+dead) / lastSweep / best / top
+```
+
+Egress env overrides:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EGRESS_SWEEP_CONCURRENCY` | `30` | Proxies re-tested in parallel per sweep |
+| `EGRESS_SWEEP_INTERVAL_MS` | `180000` | Base sweep interval (3 min); busy mode tightens to 20 s |
+| `EGRESS_PROBE_TIMEOUT_MS` | `15000` | Per-proxy probe timeout |
+| `EGRESS_DEAD_RETEST_MS` | `1800000` | Dustbin retest delay for dead proxies |
+| `EGRESS_OK_REVERIFY_MS` | `600000` | Re-verify `ok` proxies older than this |
+| `EGRESS_POOL_MAX` | `400` | Max pool entries |
+| `EGRESS_FAST_MAX_LATENCY_MS` / `EGRESS_FAST_MIN_SPEED` / `EGRESS_FAST_MIN_UPTIME` | `500` / `800` / `90` | geonode "fast only" filters |
+
 ## Connect an agent
 
 ```
@@ -209,6 +270,7 @@ PI Agent example:
 - `GET /health`, `/` — health text
 - `GET /__session` — local fingerprint/session status (includes `fingerprint.source`: `generated` = computed in pure JS)
 - `GET /__models` — local model-registry cache status (`?refresh=1` forces a re-fetch)
+- `GET /__egress` — egress pool / dustbin / last-sweep status (see "Egress IP pool")
 
 ## Models
 

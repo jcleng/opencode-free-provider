@@ -24,7 +24,8 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo } from './src/routes.js'
+import { startSweeper } from './src/egress.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
@@ -82,6 +83,11 @@ const server = http.createServer(async (req, res) => {
       return await handleModelsInfo(req, res, url)
     }
 
+    // /__egress — local egress-pool status (pool / dustbin / last sweep).
+    if (method === 'GET' && path === '/__egress') {
+      return handleEgressInfo(req, res)
+    }
+
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })
   } catch (err) {
     console.error(`[opencode-free-provider] unhandled request error: ${err && err.stack || err}`)
@@ -102,6 +108,9 @@ function start() {
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
+    // Background egress sweeper: scrapes fast proxies from the web, re-tests the
+    // pool + dustbin in parallel (default 30 IPs), and keeps the rotation fresh.
+    startSweeper()
     // Log the generated fingerprint so the first chat request is predictable.
     // Generation is pure JS and synchronous, so there is no warm-up cost; this
     // is purely informational.

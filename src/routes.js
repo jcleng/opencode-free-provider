@@ -2,6 +2,7 @@ import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState }
 import { fingerprintState } from './fingerprint.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 import { relayChatCompletions } from './upstream.js'
+import { egressState } from './egress.js'
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj)
@@ -49,6 +50,11 @@ export async function handleModelsInfo(req, res, url) {
 // x-opencode-session mode/state so the operator can confirm the fingerprint.
 export function handleSessionInfo(req, res) {
   return sendJson(res, 200, { provider: PROVIDER, ...sessionState(), fingerprint: fingerprintState() })
+}
+
+// Local debug endpoint (never forwarded upstream). Egress pool / dustbin state.
+export function handleEgressInfo(req, res) {
+  return sendJson(res, 200, { provider: PROVIDER, egress: egressState() })
 }
 
 export async function handleModel(req, res, id) {

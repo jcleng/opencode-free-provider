@@ -1,1 +1,10 @@
 .vscode/
+node_modules/
+egress-pool.json
+egress-dustbin.json
+server.pid
+server.log
+.oc-headers.sh
+.oc-body.json
+.geonode.html
+.src-*
