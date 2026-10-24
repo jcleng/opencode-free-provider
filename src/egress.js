@@ -41,6 +41,10 @@ export const FAST_MIN_UPTIME = Number(process.env.EGRESS_FAST_MIN_UPTIME) || 90
 export const DEAD_RETEST_MS = Number(process.env.EGRESS_DEAD_RETEST_MS) || 30 * 60_000
 // max pool entries kept
 export const POOL_MAX = Number(process.env.EGRESS_POOL_MAX) || 400
+// scraping SCRAPE_SOURCES is OFF by default (opt-in via EGRESS_SCRAPE_ENABLED=true/1);
+// when off, the pool only uses entries already in egress-pool.json + direct egress
+export const SCRAPE_ENABLED =
+  process.env.EGRESS_SCRAPE_ENABLED === 'true' || process.env.EGRESS_SCRAPE_ENABLED === '1'
 
 const SCRAPE_SOURCES = [
   {
@@ -323,7 +327,7 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
   if (sweeping) return { skipped: true }
   sweeping = true
   try {
-    if (scrape) {
+    if (scrape && SCRAPE_ENABLED) {
       const fresh = await scrapeSources()
       const added = addCandidates(fresh, 'scrape')
       if (added) console.log(`[egress] +${added} new candidates from web`)
@@ -379,6 +383,7 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
 export async function ensureEgress({ quick = 3 } = {}) {
   const best = pickEgress()
   if (best) return best
+  if (!SCRAPE_ENABLED) return best
   if (!pool.some((e) => e.status === 'untested' && !isDustbinned(e.proxy))) {
     const fresh = await scrapeSources().catch(() => [])
     const added = addCandidates(fresh, 'scrape')

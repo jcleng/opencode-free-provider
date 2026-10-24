@@ -221,6 +221,7 @@ Egress env overrides:
 | `EGRESS_DEAD_RETEST_MS` | `1800000` | Dustbin retest delay for dead proxies |
 | `EGRESS_OK_REVERIFY_MS` | `600000` | Re-verify `ok` proxies older than this |
 | `EGRESS_POOL_MAX` | `400` | Max pool entries |
+| `EGRESS_SCRAPE_ENABLED` | `false` | Set to `true`/`1` to enable scraping the SCRAPE_SOURCES free-proxy websites (sweep + fast-rotate); default off, pool then only uses `egress-pool.json` entries + direct egress |
 | `EGRESS_FAST_MAX_LATENCY_MS` / `EGRESS_FAST_MIN_SPEED` / `EGRESS_FAST_MIN_UPTIME` | `500` / `800` / `90` | geonode "fast only" filters |
 
 ## Connect an agent
