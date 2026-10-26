@@ -29,6 +29,15 @@ COPY . .
 ENV HOST=0.0.0.0
 ENV PORT=8791
 
+# Make the built-in fetch honor https_proxy/HTTPS_PROXY when an outbound proxy is
+# supplied at runtime (Node >= 24). No proxy env set = direct connection.
+ENV NODE_USE_ENV_PROXY=1
+
+# Node's Happy Eyeballs gives each resolved address only 250ms to connect. The
+# opencode.ai Cloudflare edge often needs longer, which surfaced as intermittent
+# "fetch failed (ETIMEDOUT)" even though curl worked. See src/network.js.
+ENV ZEN_CONNECT_ATTEMPT_TIMEOUT_MS=3000
+
 EXPOSE 8791
 
 # `node server.js` auto-listens because it is executed directly (import.meta.url).

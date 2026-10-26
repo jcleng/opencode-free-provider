@@ -1,3 +1,5 @@
+// Apply the outbound connect-timeout tuning before any fetch is made.
+import './network.js'
 import {
   getOpencodeBase, OPENCODE_UA, LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
   isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders,
@@ -23,6 +25,147 @@ function abortedError() {
 }
 
 // ---------------------------------------------------------------------------
+// Quota exhaustion (429 FreeUsageLimitError / GoUsageLimitError)
+// ---------------------------------------------------------------------------
+// A plain 429 ("slow down") is a transient throttle and is worth retrying. The
+// Zen free tier ALSO returns 429 for an exhausted daily quota, with a body like:
+//
+//   {"type":"error","error":{"type":"FreeUsageLimitError","message":
+//    "Free usage limit reached. ... subscribe to OpenCode Go ..."}}
+//
+// and a `Retry-After` measured in hours. That is an account/IP budget, not a
+// throttle: retrying 500ms later can never succeed, it only burns three
+// upstream round-trips and spams the log (exactly the reported symptom). We
+// classify it separately, surface `Retry-After`, and remember the reset time so
+// every subsequent request fails fast until the quota is replenished.
+const QUOTA_ERROR_TYPES = new Set([
+  'freeusagelimiterror',
+  'gousagelimiterror',
+  'creditlimitexceeded',
+  'quotaexceedederror',
+])
+const QUOTA_MESSAGE_RE =
+  /free usage limit|usage limit reached|subscribe to opencode go|monthly usage limit|quota (?:exhausted|reached)|insufficient[_ ]quota/i
+const QUOTA_COOLDOWN_FALLBACK_MS = 60_000
+
+const quota = {
+  until: 0, // epoch ms; requests fail fast while now < until
+  resetAt: null,
+  message: '',
+  upstreamType: '',
+  identity: '',
+  hits: 0,
+}
+
+export function quotaState() {
+  const now = Date.now()
+  const active = quota.until > now
+  return {
+    active,
+    until: active ? new Date(quota.until).toISOString() : null,
+    resetAt: quota.resetAt ? new Date(quota.resetAt).toISOString() : null,
+    remainingSeconds: active ? Math.ceil((quota.until - now) / 1000) : 0,
+    hits: quota.hits,
+    upstreamType: quota.upstreamType || null,
+    message: quota.message || null,
+  }
+}
+
+// Tests (and an operator after topping up / switching keys) can clear the gate.
+export function resetQuotaState() {
+  quota.until = 0
+  quota.resetAt = null
+  quota.message = ''
+  quota.upstreamType = ''
+  quota.identity = ''
+  quota.hits = 0
+}
+
+function quotaBlocked() {
+  return quota.until > Date.now() && quota.identity === resolveApiKey()
+}
+
+function quotaError() {
+  const e = new Error(quota.message || 'OpenCode Zen free-tier quota exhausted')
+  e.code = 'QUOTA_EXHAUSTED'
+  e.status = 429
+  e.quota = true
+  e.retryAfterMs = Math.max(0, quota.until - Date.now())
+  e.resetAt = quota.until
+  return e
+}
+
+function markQuotaExhausted(err) {
+  const now = Date.now()
+  const resetAt = Number.isFinite(err.resetAt) && err.resetAt > now
+    ? err.resetAt
+    : now + QUOTA_COOLDOWN_FALLBACK_MS
+  quota.until = resetAt
+  quota.resetAt = resetAt
+  quota.upstreamType = err.upstreamType || 'FreeUsageLimitError'
+  quota.message = err.message
+  quota.identity = resolveApiKey()
+  quota.hits += 1
+  console.warn(
+    `[opencode-free-provider] free-tier quota exhausted (${quota.upstreamType}); ` +
+    `failing fast until ${new Date(resetAt).toISOString()}`,
+  )
+}
+
+// Parse the small subset of the upstream error shape we need.
+function parseErrorPayload(raw) {
+  try {
+    const parsed = JSON.parse(raw)
+    const error = parsed && parsed.error
+    if (error && typeof error === 'object') {
+      return { type: String(error.type || ''), message: String(error.message || '') }
+    }
+    if (typeof error === 'string') return { type: '', message: error }
+    if (parsed && typeof parsed.message === 'string') {
+      return { type: String(parsed.type || ''), message: parsed.message }
+    }
+  } catch { /* non-JSON body */ }
+  return { type: '', message: '' }
+}
+
+// `Retry-After` is either delta-seconds or an HTTP date. Return ms or null.
+function parseRetryAfter(value) {
+  if (value == null || value === '') return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000)
+  const date = Date.parse(value)
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
+  return null
+}
+
+function upstreamHttpError(status, raw, retryAfterHeader) {
+  const { type, message } = parseErrorPayload(raw)
+  const retryAfterMs = parseRetryAfter(retryAfterHeader)
+  const isQuota = status === 429 && (
+    QUOTA_ERROR_TYPES.has(type.toLowerCase()) || QUOTA_MESSAGE_RE.test(message || raw)
+  )
+
+  const e = new Error(`OpenCode Zen HTTP ${status}: ${(raw || '').slice(0, 300)}`)
+  e.status = status
+  if (retryAfterMs != null) e.retryAfterMs = retryAfterMs
+
+  if (isQuota) {
+    e.code = 'QUOTA_EXHAUSTED'
+    e.quota = true
+    e.retryable = false
+    e.upstreamType = type || 'FreeUsageLimitError'
+    e.resetAt = retryAfterMs != null ? Date.now() + retryAfterMs : null
+    return e
+  }
+
+  e.code = status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'TRANSPORT' : 'PROVIDER_ERROR'
+  // 429 with a generic body and 5xx are transient; other 4xx are not.
+  e.retryable = status === 429 || status >= 500
+  return e
+}
+
+
+// ---------------------------------------------------------------------------
 // Transport-failure classification + retry policy
 // ---------------------------------------------------------------------------
 // Node's global fetch surfaces network-level failures as TypeError("fetch
@@ -40,6 +183,8 @@ const RETRYABLE_CAUSE_CODES = new Set([
 
 function isRetryableUpstreamError(err) {
   if (!err) return false
+  // Account/IP budget exhaustion is deterministic until the reset time.
+  if (err.quota || err.code === 'QUOTA_EXHAUSTED') return false
   if (err.retryable === true) return true
   if (err.code === 'RATE_LIMITED' || err.code === 'TRANSPORT') return true
   if (err.name === 'AbortError') return true // our per-request timeout fired
@@ -123,6 +268,11 @@ export async function* relayChatCompletions(opts) {
     model, messages, system, tools, maxTokens, temperature, stream, topP, signal, timeoutMs,
   } = opts
 
+  // The free-tier quota is per IP/account and resets on a schedule. While it is
+  // exhausted, replaying the request upstream is guaranteed to 429 again, so
+  // fail immediately with the reset time instead of burning retries.
+  if (quotaBlocked()) throw quotaError()
+
   const clientToolNames = callerToolNames(tools)
   // Await the real opencode fingerprint once (cached/promised inside config.js).
   const fpHeaders = await getFingerprintHeaders().catch(() => null)
@@ -166,12 +316,7 @@ export async function* relayChatCompletions(opts) {
 
     if (!response.ok) {
       const raw = await response.text().catch(() => '')
-      const status = response.status
-      const code = status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'TRANSPORT' : 'PROVIDER_ERROR'
-      const e = new Error(`OpenCode Zen HTTP ${status}: ${raw.slice(0, 300)}`)
-      e.code = code
-      e.status = status
-      throw e
+      throw upstreamHttpError(response.status, raw, response.headers.get('retry-after'))
     }
 
     const ctype = response.headers.get('content-type') || ''
@@ -204,9 +349,17 @@ export async function* relayChatCompletions(opts) {
     } catch (err) {
       if (signal?.aborted) throw abortedError()
       lastError = err
+      if (err.code === 'QUOTA_EXHAUSTED') {
+        // Deterministic until the reset time: record it, fail fast afterwards.
+        markQuotaExhausted(err)
+        throw err
+      }
       if (!isRetryableUpstreamError(err)) throw err
       if (attempt >= attempts - 1) break
-      const waitMs = backoffMs(attempt)
+      // A transient 429 may still carry Retry-After; honor it (capped so a
+      // single client request cannot be held open for minutes).
+      const retryAfterMs = Number(err.retryAfterMs) || 0
+      const waitMs = Math.max(backoffMs(attempt), Math.min(retryAfterMs, 10_000))
       console.warn(`[opencode-free-provider] upstream attempt ${attempt + 1}/${attempts} failed: ${err.message}; retrying in ${waitMs}ms`)
       await sleep(waitMs)
       continue
@@ -294,6 +447,10 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
           })),
           signal: noteController.signal,
         })
+        if (!response.ok) {
+          const raw = await response.text().catch(() => '')
+          throw upstreamHttpError(response.status, raw, response.headers.get('retry-after'))
+        }
       } finally {
         clearTimeout(noteTimer)
       }

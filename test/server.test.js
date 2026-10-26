@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { PROVIDER } from '../src/config.js'
+import { resetQuotaState } from '../src/upstream.js'
 import server, { start } from '../server.js'
 let upstream
 let lastUpstreamReq
@@ -30,8 +31,8 @@ function startUpstream() {
           return
         }
         if (failWith) {
-          res.writeHead(failWith.status, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: failWith.error }))
+          res.writeHead(failWith.status, { 'Content-Type': 'application/json', ...(failWith.headers || {}) })
+          res.end(failWith.raw ?? JSON.stringify({ error: failWith.error }))
           return
         }
         const parsed = JSON.parse(body || '{}')
@@ -191,5 +192,36 @@ test('streaming proxy returns proper HTTP error when upstream fails before strea
     assert.equal(json.error.code, 'PROVIDER_ERROR')
   } finally {
     failWith = null
+  }
+})
+
+test('exhausted free-tier quota returns 429 + Retry-After with an actionable message', async () => {
+  failWith = {
+    status: 429,
+    headers: { 'Retry-After': '3600' },
+    raw: JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'FreeUsageLimitError',
+        message: 'Free usage limit reached. Free models work in OpenCode; subscribe to OpenCode Go to keep going: https://opencode.ai/go',
+      },
+    }),
+  }
+  try {
+    const res = await fetchProxy('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: `${PROVIDER}/big-pickle`, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), '3600', 'upstream Retry-After is propagated')
+    assert.ok(res.headers.get('x-opencode-quota-reset'), 'reset timestamp is exposed')
+    const json = await res.json()
+    assert.equal(json.error.code, 'QUOTA_EXHAUSTED')
+    assert.match(json.error.message, /quota is exhausted/i)
+    assert.match(json.error.message, /OPENCODE_ZEN_API_KEY|opencode\.ai\/go/i)
+  } finally {
+    failWith = null
+    resetQuotaState()
   }
 })
