@@ -7,7 +7,17 @@
 //   POST /v1/chat/completions   (stream: true/false → SSE / JSON)
 //
 // Every request is relayed (with the shared literal key "Bearer public") to
-// OpenCode Zen's free tier (https://opencode.ai/zen/v1). No login, no key.
+// OpenCode Zen's free tier (https://opencode.ai/inference/openai/v1). No login,
+// no key.
+//
+// RUN IT WITH BUN (see Dockerfile). The free tier fingerprints the *TLS client
+// hello* of the calling process: requests sent from Bun (the runtime OpenCode
+// itself ships) are accepted, while the same request sent from Node's
+// TLS/OpenSSL stack is answered with
+//   429 FreeUsageLimitError "Free usage limit reached…"
+// even when the IP still has free quota left. `node server.js` therefore works
+// as an OpenAI-compatible proxy only for endpoints that do not enforce that
+// gate; the free tier needs `bun server.js`.
 //
 // Connect an agent (e.g. OpenCode) with:
 //   baseURL: http://127.0.0.1:8791/v1
@@ -28,6 +38,8 @@ import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, ha
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
+const IS_BUN = typeof Bun !== 'undefined'
+const RUNTIME = IS_BUN ? `bun ${Bun.version}` : `node ${process.version}`
 
 function sendText(res, status, text, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...headers })
@@ -100,8 +112,15 @@ function start() {
     process.exit(1)
   })
   server.listen(PORT, HOST, () => {
-    console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1`)
+    console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1 (${RUNTIME})`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
+    if (!IS_BUN) {
+      console.warn(
+        '[opencode-free-provider] WARNING: running under Node. The free tier fingerprints the outbound '
+        + 'TLS client hello; Node/OpenSSL is rejected with 429 FreeUsageLimitError even with quota left. '
+        + 'Run `bun server.js` (the Docker image already does).',
+      )
+    }
     // Log the generated fingerprint so the first chat request is predictable.
     // Generation is pure JS and synchronous, so there is no warm-up cost; this
     // is purely informational.

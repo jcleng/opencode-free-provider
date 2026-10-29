@@ -273,13 +273,20 @@ export async function* relayChatCompletions(opts) {
   // fail immediately with the reset time instead of burning retries.
   if (quotaBlocked()) throw quotaError()
 
+  // `systemEnv` enables the OpenCode environment-block fingerprint that the
+  // free tier requires in the system prompt (see injectOpencodeSystemEnv in
+  // src/conversions.js). `null`/`undefined` disables it (used by tests).
+  const systemEnv = opts.systemEnv === null || opts.systemEnv === undefined
+    ? null
+    : opts.systemEnv
+
   const clientToolNames = callerToolNames(tools)
   // Await the real opencode fingerprint once (cached/promised inside config.js).
   const fpHeaders = await getFingerprintHeaders().catch(() => null)
   const baseBody = buildRequestBody({
     model, messages, system, tools,
     maxTokens: maxTokens || DEFAULT_MAX_TOKENS,
-    temperature, stream: true, topP,
+    temperature, stream: true, topP, systemEnv,
   })
 
   // The wire conversation we keep re-sending to upstream (starts as the request
@@ -324,7 +331,7 @@ export async function* relayChatCompletions(opts) {
       // Fully consume the upstream stream (this is where a mid-stream connection
       // drop surfaces) and translate fingerprint tool calls for the agent.
       if (ctype.includes('event-stream')) {
-        return await runTranslateLoop(response, opts, wireMessages, wireTools, clientToolNames, fpHeaders)
+        return await runTranslateLoop(response, { ...opts, systemEnv }, wireMessages, wireTools, clientToolNames, fpHeaders)
       }
       // Unexpected non-stream JSON response for a streaming request.
       const payload = await response.json().catch(() => null)
@@ -387,7 +394,7 @@ export async function* relayChatCompletions(opts) {
  * execution) until the model yields either real agent work or a final answer.
  */
 async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames, fpHeaders) {
-  const { model, maxTokens, temperature, topP, timeoutMs } = opts
+  const { model, maxTokens, temperature, topP, timeoutMs, systemEnv } = opts
   let wire = [...wireMessages]
   let response = firstResponse
 
@@ -443,7 +450,7 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
         response = await fetch(`${getOpencodeBase()}/chat/completions`, {
           method: 'POST', headers: fingerprintHeaders(fpHeaders),
           body: JSON.stringify(buildWireBody({
-            model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP,
+            model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP, systemEnv,
           })),
           signal: noteController.signal,
         })

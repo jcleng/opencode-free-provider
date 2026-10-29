@@ -1,16 +1,21 @@
 # opencode-free-provider
 
 A local **OpenAI-compatible** proxy that relays chat requests to the
-[OpenCode Zen free tier](https://opencode.ai/zen/v1). Point any OpenAI-compatible
-agent (OpenCode, rikkahub, etc.) at it and use the free models with no API key.
+[OpenCode Zen free tier](https://opencode.ai/inference/openai/v1). Point any
+OpenAI-compatible agent (OpenCode, rikkahub, etc.) at it and use the free models
+with no API key.
 
 ```
-Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (opencode.ai/zen/v1)
+Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (opencode.ai/inference/openai/v1)
 ```
+
+> **Run it with Bun, not Node.** The free tier fingerprints the *outbound TLS
+> client hello*; Node/OpenSSL is answered with `429 FreeUsageLimitError` even on
+> an IP that still has free quota. See [Two gates, not one](#two-gates-not-one).
 
 ## Why a proxy is needed
 
-`opencode.ai/zen/v1` enforces a **client-fingerprint gate**: a bare request is
+`opencode.ai/inference/openai/v1` enforces a **client-fingerprint gate**: a bare request is
 rejected with `403 FreeTierError: OpenCode's free tier can only be used from
 within OpenCode`. The upstream only accepts a request that carries **all** of:
 
@@ -48,16 +53,50 @@ the fingerprint is fully computed in pure JS on every request.
 
 ```bash
 # Override the advertised User-Agent (default: opencode/latest/2.0.22/cli):
-OPENCODE_UA=opencode/2.0.27 node server.js
+OPENCODE_UA=opencode/2.0.27 bun server.js
 ```
+
+## Two gates, not one
+
+The free tier has **two** independent gates, and they fail with *different*
+errors. Knowing which one you hit is the whole diagnosis:
+
+| Gate | What it checks | Failure |
+|---|---|---|
+| Client fingerprint | `User-Agent` + `x-opencode-session` id shape + `stream:true` + the four tools | `403 FreeTierError` |
+| Runtime fingerprint | the outbound **TLS client hello** (Bun — the stack OpenCode ships) **and** OpenCode's `<env>` block in the system prompt | `429 FreeUsageLimitError` |
+
+The 429 is *not* a plain rate limit and the message ("Free usage limit
+reached…") is misleading. Ablation against the live endpoint pinned it down:
+
+- the **byte-identical** request that returns `200` from Bun returns `429` when
+  it is replayed through a Node TLS tunnel (verified by terminating TLS in a
+  local proxy: real OpenCode client → tunnel with Bun TLS ends up 200, the same
+  request sent with Node's `fetch` → 429);
+- Node's TLS knobs (`ciphers`, `ecdhCurve`, `sigalgs`, ALPN, TLS 1.2 vs 1.3) do
+  **not** change the verdict — it is the client-hello fingerprint as a whole;
+- removing OpenCode's `<env>` block (or truncating it) flips a Bun request back
+  to `429`, while appending the block to an arbitrary system prompt flips it to
+  `200`;
+- the same 429 appears from other egress IPs, so it is not an IP quota.
+
+Hence: **relay with Bun** (the proxy does, and the Docker image enforces it) and
+**inject the `<env>` block** into every upstream body (`injectOpencodeSystemEnv`
+in `src/conversions.js`, applied in `finalizeBody` so follow-up turns carry it
+too). The agent's own system prompt is preserved — the block is appended, never
+replaces instructions.
 
 ## Run
 
 ```bash
-npm start            # listens on http://127.0.0.1:8791/v1
+npm start            # = bun server.js, listens on http://127.0.0.1:8791/v1
 # or
-node server.js
+bun server.js
 ```
+
+`node server.js` still starts (the server is plain `node:http`), but every chat
+request will be answered with `429 FreeUsageLimitError` — the Node TLS stack is
+rejected by the runtime gate. The process logs a warning in that case.
 
 Env overrides:
 
@@ -65,12 +104,14 @@ Env overrides:
 |---|---|---|
 | `PORT` | `8791` | Listen port |
 | `HOST` | `127.0.0.1` | Bind host |
-| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | Point the relay elsewhere (used by tests) |
+| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/inference/openai/v1` | Point the relay elsewhere (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call, safest) or `sticky` (reuse one for the process) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | When `sticky`, rotate the session every N seconds |
 | `ZEN_MODELS_TTL_SECONDS` | `600` | How long (seconds) the discovered model list is cached before re-fetching from upstream (`0` = never expire) |
 | `ZEN_MODELS_TIMEOUT_MS` | `5000` | Timeout for the upstream `GET /models` discovery request |
 | `OPENCODE_UA` | `opencode/latest/2.0.22/cli` | User-Agent advertised to the free-tier gate |
+| `OPENCODE_ENV_CWD` | `/` | Working directory advertised in the injected `<env>` block (the caller's `x-opencode-directory` header wins when present) |
+| `OPENCODE_SYSTEM_FP` | _(unset)_ | Set to `0` to disable the `<env>` block injection (expect `429 FreeUsageLimitError` from the free tier) |
 | `https_proxy` / `HTTPS_PROXY` | _(unset)_ | Outbound HTTPS proxy for reaching `opencode.ai`. Requires `NODE_USE_ENV_PROXY=1` (see below) |
 | `NODE_USE_ENV_PROXY` | _(unset)_ | Set to `1` to make the built-in `fetch` honor `https_proxy`/`HTTPS_PROXY` |
 
@@ -97,9 +138,13 @@ every request fails upstream with `403 FreeTierError`.
 
 ## Docker
 
-The image is a plain **Debian/glibc** Node base (`node:24-bookworm-slim`) — the
-fingerprint is generated in pure JS (`src/fingerprint.js`), so no `opencode` CLI,
-no `openssl`, and no MITM are needed inside the container.
+The image is based on **`oven/bun`** (Debian) and runs `bun server.js`. The
+runtime matters: the free tier fingerprints the outbound TLS client hello and
+Node/OpenSSL is rejected with `429 FreeUsageLimitError` (see
+[Two gates, not one](#two-gates-not-one)). Both fingerprints (headers/session id
+and the `<env>` block) are generated in pure JS (`src/fingerprint.js`,
+`src/conversions.js`), so no `opencode` CLI, no `openssl`, and no MITM are needed
+inside the container.
 
 ```bash
 # Build:
@@ -113,23 +158,24 @@ Once up, point your agent at `http://<host>:8791/v1` (apiKey `public`). Verify
 fingerprint generation:
 
 ```bash
-curl http://127.0.0.1:8791/__session      # expect fingerprint.source == "generated"
+curl http://127.0.0.1:8791/__session      # expect runtime == "bun x.y.z" and fingerprint.source == "generated"
 ```
 
 ## Outbound proxy (reaching opencode.ai)
 
 The relay itself is a plain HTTP server on `127.0.0.1:8791`; the **outbound**
-request it makes to `https://opencode.ai/zen/v1` uses Node's built-in global
-`fetch` (undici). That `fetch` does **not** read `https_proxy`/`HTTPS_PROXY` by
-default — you must opt in.
+request it makes to `https://opencode.ai/inference/openai/v1` uses the runtime's
+global `fetch` (Bun's when run with `bun server.js`). Bun's `fetch` honors
+`https_proxy`/`HTTPS_PROXY` on its own; under Node, `fetch` (undici) does **not**
+read them unless you opt in (see below).
 
 To send the upstream traffic through an HTTP proxy (e.g. `http://127.0.0.1:20171`):
 
 ```bash
 export https_proxy=http://127.0.0.1:20171
 export HTTPS_PROXY=http://127.0.0.1:20171   # case-insensitive; both are read
-export NODE_USE_ENV_PROXY=1                 # REQUIRED: makes global fetch honor the proxy
-node server.js
+export NODE_USE_ENV_PROXY=1                 # REQUIRED under Node: makes global fetch honor the proxy
+bun server.js                               # Bun needs no extra flag
 ```
 
 `NODE_USE_ENV_PROXY=1` is the critical flag — without it, merely exporting
@@ -214,7 +260,7 @@ PI Agent example:
 
 The model list is **discovered live**: on startup (and whenever the cache is
 stale) the proxy calls
-`curl https://opencode.ai/zen/v1/models` (via `GET {OPENCODE_BASE}/models` in
+`curl https://opencode.ai/inference/openai/v1/models` (via `GET {OPENCODE_BASE}/models` in
 `src/config.js`) and keeps only the ids whose id contains `big-pickle` **or**
 contains `-free` — everything else (claude/gpt/gemini/… ids on the upstream list)
 is filtered out. The result is cached for `ZEN_MODELS_TTL_SECONDS` (default 600s);
@@ -224,7 +270,7 @@ built-in fallback is `big-pickle`).
 ## Test
 
 ```bash
-npm test             # 50 unit tests (mock upstream)
+npm test             # 66 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the

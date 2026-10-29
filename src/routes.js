@@ -3,6 +3,8 @@ import { fingerprintState } from './fingerprint.js'
 import { quotaState, relayChatCompletions } from './upstream.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
 
+const RUNTIME = typeof Bun !== 'undefined' ? `bun ${Bun.version}` : `node ${process.version}`
+
 function sendJson(res, status, obj, headers = {}) {
   const body = JSON.stringify(obj)
   res.writeHead(status, {
@@ -51,6 +53,7 @@ export async function handleModelsInfo(req, res, url) {
 export function handleSessionInfo(req, res) {
   return sendJson(res, 200, {
     provider: PROVIDER,
+    runtime: RUNTIME,
     ...sessionState(),
     fingerprint: fingerprintState(),
     quota: quotaState(),
@@ -95,8 +98,25 @@ function quotaMessage(err) {
     ? ` Resets at ${resetAt.toISOString()} (in ~${formatDuration(resetAt.getTime() - Date.now())}).`
     : ''
   return `OpenCode Zen free-tier quota is exhausted for this IP/account.${when} `
-    + 'Free models are only usable inside OpenCode: subscribe to OpenCode Go (https://opencode.ai/go), '
-    + 'set OPENCODE_ZEN_API_KEY to use your own Zen key, or route the relay through a different egress IP.'
+    + 'This gate is about the CLIENT, not an IP quota: the relay must run on Bun '
+    + '(bun server.js — the Docker image already does; Node/OpenSSL is rejected) and must send '
+    + "OpenCode's <env> system-prompt block (OPENCODE_SYSTEM_FP must not be 0). "
+    + 'To bypass the free tier entirely, set OPENCODE_ZEN_API_KEY to use your own Zen key, '
+    + 'or subscribe to OpenCode Go (https://opencode.ai/go).'
+}
+
+// Resolve the environment info injected into the system prompt as OpenCode's
+// <env> block (the free tier rejects requests without it with
+// 429 FreeUsageLimitError — see injectOpencodeSystemEnv in src/conversions.js).
+// Returns null when the caller opted out via OPENCODE_SYSTEM_FP=0.
+function requestSystemEnv(req) {
+  if (process.env.OPENCODE_SYSTEM_FP === '0') return null
+  const h = req.headers || {}
+  const directory =
+    h['x-opencode-directory'] || h['x-opencode-cwd'] || h['x-cwd'] || h['x-working-directory']
+  return {
+    directory: typeof directory === 'string' && directory.trim() ? directory.trim() : undefined,
+  }
 }
 
 export async function handleChatCompletions(req, res) {
@@ -128,6 +148,13 @@ export async function handleChatCompletions(req, res) {
   const { model } = splitModelId(requested)
   const stream = parsed.stream === true
   const timeoutMs = Number.isFinite(parsed.timeout_ms) ? parsed.timeout_ms : 60000
+
+  // The free tier fingerprints the system prompt as well as the headers: it
+  // expects OpenCode's <env> block (see injectOpencodeSystemEnv in
+  // src/conversions.js). Forward the caller's working directory when it
+  // advertises one (OpenCode sends `x-opencode-directory`); otherwise the block
+  // falls back to OPENCODE_ENV_CWD. OPENCODE_SYSTEM_FP=0 disables it.
+  const systemEnv = requestSystemEnv(req)
 
   // Abort the upstream fetch if the client disconnects.
   const clientAbort = new AbortController()
@@ -164,6 +191,7 @@ export async function handleChatCompletions(req, res) {
         topP: parsed.top_p,
         signal: clientAbort.signal,
         timeoutMs,
+        systemEnv,
       })) {
         if (!started) startStream()
         res.write(`data: ${JSON.stringify(chunk)}\n\n`)
@@ -184,6 +212,7 @@ export async function handleChatCompletions(req, res) {
         topP: parsed.top_p,
         signal: clientAbort.signal,
         timeoutMs,
+        systemEnv,
       })) {
         completion = obj
       }
@@ -199,7 +228,9 @@ export async function handleChatCompletions(req, res) {
     const message = err.code === 'QUOTA_EXHAUSTED'
       ? quotaMessage(err)
       : err.code === 'RATE_LIMITED'
-        ? 'Rate limit reached on the OpenCode Zen free tier. Try a different network/IP (the free quota is per-IP) or wait.'
+        ? 'OpenCode Zen rejected the request with 429 FreeUsageLimitError. This is the runtime/system-prompt '
+          + 'gate, not an IP quota: run the relay on Bun (bun server.js) and keep the injected <env> block '
+          + '(OPENCODE_SYSTEM_FP must not be 0). See README "Two gates, not one".'
         : `Upstream error from OpenCode Zen: ${err.message}`
     // Propagate the upstream reset hint so OpenAI-compatible clients back off
     // instead of hammering the relay (and the relay hammering upstream).

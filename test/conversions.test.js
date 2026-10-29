@@ -15,6 +15,8 @@ import {
   decodeTranslatedId,
   normalizeToolArguments,
   sanitizeWireMessages,
+  injectOpencodeSystemEnv,
+  opencodeEnvBlock,
 } from '../src/conversions.js'
 import { isFingerprintTool } from '../src/config.js'
 import { splitModelId, findModel, isValidModel, listModelsPayload } from '../src/models.js'
@@ -353,4 +355,69 @@ test('serializeMessages normalizes malformed tool-call arguments to {}', functio
     tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '' } }],
   }])
   assert.equal(wire[0].tool_calls[0].function.arguments, '{}')
+})
+
+// ---------------------------------------------------------------------------
+// OpenCode system-prompt fingerprint (the free tier's second gate)
+// ---------------------------------------------------------------------------
+// The free tier rejects a request with 429 FreeUsageLimitError when the system
+// prompt does not carry OpenCode's environment block, even on an IP that still
+// has free quota. These tests pin the injection contract: additive, idempotent,
+// and only applied when the caller opted in (systemEnv).
+
+test('injectOpencodeSystemEnv appends the <env> block to the caller system prompt', function () {
+  const wire = [
+    { role: 'system', content: 'be nice' },
+    { role: 'user', content: 'hi' },
+  ]
+  const out = injectOpencodeSystemEnv(wire, { directory: '/work' })
+  assert.equal(out.length, 2)
+  assert.equal(out[0].role, 'system')
+  assert.ok(out[0].content.startsWith('be nice\n\n'), 'caller instructions are preserved')
+  assert.match(out[0].content, /Here is some useful information about the environment you are running in:/)
+  assert.match(out[0].content, /<env>/)
+  assert.match(out[0].content, /Working directory: \/work/)
+  assert.match(out[0].content, /Workspace root folder: \/work/)
+  assert.match(out[0].content, /Is directory a git repo: /)
+  assert.match(out[0].content, /Platform: /)
+  assert.match(out[0].content, /<\/env>/)
+  assert.equal(out[1].content, 'hi', 'other messages are untouched')
+})
+
+test('injectOpencodeSystemEnv is idempotent when the caller is OpenCode itself', function () {
+  const wire = [{ role: 'system', content: 'x\n<env>\n  Working directory: /a\n</env>' }]
+  assert.deepEqual(injectOpencodeSystemEnv(wire, { directory: '/b' }), wire)
+})
+
+test('injectOpencodeSystemEnv prepends a system message when the caller sent none', function () {
+  const out = injectOpencodeSystemEnv([{ role: 'user', content: 'hi' }], { directory: '/work' })
+  assert.equal(out.length, 2)
+  assert.equal(out[0].role, 'system')
+  assert.match(out[0].content, /Working directory: \/work/)
+  assert.equal(out[1].role, 'user')
+})
+
+test('opencodeEnvBlock falls back to OPENCODE_ENV_CWD and never throws', function () {
+  const prev = process.env.OPENCODE_ENV_CWD
+  process.env.OPENCODE_ENV_CWD = '/fallback'
+  try {
+    assert.match(opencodeEnvBlock(), /Working directory: \/fallback/)
+  } finally {
+    if (prev === undefined) delete process.env.OPENCODE_ENV_CWD
+    else process.env.OPENCODE_ENV_CWD = prev
+  }
+})
+
+test('buildRequestBody injects the env block only when systemEnv is provided', function () {
+  const without = buildRequestBody({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(without.messages.some((m) => m.role === 'system'), false, 'no opt-in, no injection')
+
+  const withEnv = buildRequestBody({
+    model: 'big-pickle',
+    messages: [{ role: 'user', content: 'hi' }],
+    systemEnv: { directory: '/work' },
+  })
+  assert.equal(withEnv.messages[0].role, 'system')
+  assert.match(withEnv.messages[0].content, /<env>/)
+  assert.match(withEnv.messages[0].content, /Working directory: \/work/)
 })
