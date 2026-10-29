@@ -86,6 +86,50 @@ in `src/conversions.js`, applied in `finalizeBody` so follow-up turns carry it
 too). The agent's own system prompt is preserved — the block is appended, never
 replaces instructions.
 
+## Client auth (`API_KEY`)
+
+The relay binds a public port, so by default **anyone** who knows the URL can
+spend the free-tier quota of that egress IP. `API_KEY` closes that hole: it is
+the *client→relay* credential (separate from the *relay→upstream* one, which is
+still `Bearer public` / `OPENCODE_ZEN_API_KEY`).
+
+```bash
+docker run -d --name opencode-free-provider -p 48391:8791 \
+  -e API_KEY='sk-ofp-<your-secret>' \
+  ghcr.nju.edu.cn/jcleng/opencode-free-provider:latest
+```
+
+Clients then configure exactly that value:
+
+```jsonc
+"opencode-zen-server": {
+  "baseUrl": "http://<host>:48391/v1",
+  "api": "openai-completions",
+  "apiKey": "sk-ofp-<your-secret>",   // == API_KEY
+  "models": [
+    { "id": "big-pickle", "contextWindow": 200000 }
+  ]
+}
+```
+
+Semantics:
+
+| `API_KEY` | Behaviour |
+|---|---|
+| unset / empty | client auth disabled (backwards compatible) |
+| `public` (image default) | the historical `apiKey: public` keeps working — convenient, not a secret |
+| any other value | requests without it get `401 {"code":"invalid_api_key"}` |
+
+Accepted presentations: `Authorization: Bearer <API_KEY>` (what OpenAI clients
+send) and `x-api-key: <API_KEY>`. `/` and `/health` stay public; `/v1/*` **and**
+the `/__*` debug endpoints require the key (they expose the generated session
+id). `GET /__session` reports `auth.required`.
+
+```bash
+curl -s http://127.0.0.1:8791/v1/models                                    # 401 when API_KEY is set
+curl -s -H 'Authorization: Bearer sk-ofp-…' http://127.0.0.1:8791/v1/models # 200
+```
+
 ## Run
 
 ```bash
@@ -112,6 +156,7 @@ Env overrides:
 | `OPENCODE_UA` | `opencode/latest/2.0.22/cli` | User-Agent advertised to the free-tier gate |
 | `OPENCODE_ENV_CWD` | `/` | Working directory advertised in the injected `<env>` block (the caller's `x-opencode-directory` header wins when present) |
 | `OPENCODE_SYSTEM_FP` | _(unset)_ | Set to `0` to disable the `<env>` block injection (expect `429 FreeUsageLimitError` from the free tier) |
+| `API_KEY` | `public` (Dockerfile) | **Client→relay** credential. When set, every `/v1` request must send it; agents use the same value as their provider `apiKey`. Empty value disables client auth. See [Client auth](#client-auth-api_key) |
 | `https_proxy` / `HTTPS_PROXY` | _(unset)_ | Outbound HTTPS proxy for reaching `opencode.ai`. Requires `NODE_USE_ENV_PROXY=1` (see below) |
 | `NODE_USE_ENV_PROXY` | _(unset)_ | Set to `1` to make the built-in `fetch` honor `https_proxy`/`HTTPS_PROXY` |
 
@@ -270,7 +315,7 @@ built-in fallback is `big-pickle`).
 ## Test
 
 ```bash
-npm test             # 66 unit tests (mock upstream)
+npm test             # 72 unit tests (mock upstream)
 ```
 
 Live end-to-end against the real free tier is exercised manually with the

@@ -2,6 +2,7 @@ import { PROVIDER, sessionState, ensureModels, refreshModels, modelsCacheState }
 import { fingerprintState } from './fingerprint.js'
 import { quotaState, relayChatCompletions } from './upstream.js'
 import { listModelsPayload, isValidModel, findModel, splitModelId } from './models.js'
+import { authRequired } from './auth.js'
 
 const RUNTIME = typeof Bun !== 'undefined' ? `bun ${Bun.version}` : `node ${process.version}`
 
@@ -54,6 +55,7 @@ export function handleSessionInfo(req, res) {
   return sendJson(res, 200, {
     provider: PROVIDER,
     runtime: RUNTIME,
+    auth: { required: authRequired() },
     ...sessionState(),
     fingerprint: fingerprintState(),
     quota: quotaState(),

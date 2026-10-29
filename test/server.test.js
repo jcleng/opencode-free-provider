@@ -225,3 +225,103 @@ test('exhausted free-tier quota returns 429 + Retry-After with an actionable mes
     resetQuotaState()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Optional client authentication (`API_KEY`, the Dockerfile env var)
+// ---------------------------------------------------------------------------
+// API_KEY is the CLIENT→relay credential: agents put the same value in their
+// provider config (`apiKey`), the relay checks `Authorization: Bearer` (or
+// `x-api-key`). Unset API_KEY = auth disabled (backwards compatible).
+
+async function withApiKey(key, fn) {
+  const prev = process.env.API_KEY
+  if (key === undefined) delete process.env.API_KEY
+  else process.env.API_KEY = key
+  try {
+    await fn()
+  } finally {
+    if (prev === undefined) delete process.env.API_KEY
+    else process.env.API_KEY = prev
+  }
+}
+
+function modelListRequest(headers) {
+  return fetchProxy('/v1/models', { headers })
+}
+
+test('API_KEY unset: /v1/models stays open (auth disabled)', async () => {
+  await withApiKey(undefined, async () => {
+    const res = await modelListRequest({})
+    assert.equal(res.status, 200)
+  })
+})
+
+test('API_KEY set: missing/invalid key is 401 with invalid_api_key', async () => {
+  await withApiKey('sk-ofp-test', async () => {
+    const missing = await modelListRequest({})
+    assert.equal(missing.status, 401)
+    assert.equal(missing.headers.get('www-authenticate'), 'Bearer')
+    const json = await missing.json()
+    assert.equal(json.error.code, 'invalid_api_key')
+
+    const wrong = await modelListRequest({ Authorization: 'Bearer nope' })
+    assert.equal(wrong.status, 401)
+
+    const wrongScheme = await modelListRequest({ Authorization: 'Basic sk-ofp-test' })
+    assert.equal(wrongScheme.status, 401)
+  })
+})
+
+test('API_KEY set: Bearer and x-api-key both authenticate', async () => {
+  await withApiKey('sk-ofp-test', async () => {
+    const bearer = await modelListRequest({ Authorization: 'Bearer sk-ofp-test' })
+    assert.equal(bearer.status, 200)
+
+    const headerKey = await modelListRequest({ 'x-api-key': 'sk-ofp-test' })
+    assert.equal(headerKey.status, 200)
+  })
+})
+
+test('API_KEY set: health/landing stays public, debug endpoints do not', async () => {
+  await withApiKey('sk-ofp-test', async () => {
+    assert.equal((await fetchProxy('/health', { headers: {} })).status, 200)
+    assert.equal((await fetchProxy('/', { headers: {} })).status, 200)
+    assert.equal((await fetchProxy('/__session', { headers: {} })).status, 401)
+    assert.equal(
+      (await fetchProxy('/__session', { headers: { Authorization: 'Bearer sk-ofp-test' } })).status,
+      200,
+    )
+  })
+})
+
+test('API_KEY set: chat completions is gated too', async () => {
+  await withApiKey('sk-ofp-test', async () => {
+    const body = JSON.stringify({ model: `${PROVIDER}/big-pickle`, messages: [{ role: 'user', content: 'hi' }] })
+    const denied = await fetchProxy('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    assert.equal(denied.status, 401)
+
+    const allowed = await fetchProxy('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk-ofp-test' },
+      body,
+    })
+    assert.equal(allowed.status, 200)
+  })
+})
+
+test('/__session reports whether client auth is required', async () => {
+  await withApiKey('sk-ofp-test', async () => {
+    const res = await fetchProxy('/__session', { headers: { Authorization: 'Bearer sk-ofp-test' } })
+    const json = await res.json()
+    assert.equal(json.auth.required, true)
+  })
+  await withApiKey(undefined, async () => {
+    const res = await fetchProxy('/__session')
+    const json = await res.json()
+    assert.equal(json.auth.required, false)
+  })
+})

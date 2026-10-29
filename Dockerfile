@@ -42,6 +42,22 @@ ENV PORT=8791
 # for any code path that still consults it.
 ENV NODE_USE_ENV_PROXY=1
 
+# CLIENT→relay credential (see src/auth.js). When set, every /v1 request must
+# send `Authorization: Bearer $API_KEY` (or `x-api-key`), and agents configure
+# exactly this value as their provider `apiKey`:
+#
+#   "opencode-zen-server": {
+#     "baseUrl": "http://<host>:<port>/v1",
+#     "api": "openai-completions",
+#     "apiKey": "<API_KEY>",
+#     "models": [{ "id": "big-pickle", "contextWindow": 200000 }]
+#   }
+#
+# Default `public` keeps the historical `apiKey: public` working; override it
+# with `docker run -e API_KEY=<secret>` to lock the relay down, or pass an empty
+# value (`-e API_KEY=`) to disable client auth entirely.
+ENV API_KEY=public
+
 # Node's Happy Eyeballs gives each resolved address only 250ms to connect. The
 # opencode.ai Cloudflare edge often needs longer, which surfaced as intermittent
 # "fetch failed (ETIMEDOUT)". See src/network.js (best-effort: Bun may not expose

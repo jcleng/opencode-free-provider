@@ -21,8 +21,12 @@
 //
 // Connect an agent (e.g. OpenCode) with:
 //   baseURL: http://127.0.0.1:8791/v1
-//   apiKey:  public            (or any non-empty string)
+//   apiKey:  <API_KEY>         (image default: "public"; unset API_KEY = no auth)
 //   model:   opencode-free/big-pickle
+//
+// `API_KEY` (Dockerfile ENV, overridable with `-e API_KEY=…`) is the
+// CLIENT→relay credential: when set, every /v1 request must send it as
+// `Authorization: Bearer <API_KEY>` (or `x-api-key`). See src/auth.js.
 //
 // The upstream free tier enforces a client-fingerprint gate (User-Agent must be
 // opencode/>=1.18, a valid x-opencode-session id, and the request body must
@@ -35,6 +39,7 @@ import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
 import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
+import { authRequired, isAuthorized, isPublicPath } from './src/auth.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
@@ -57,9 +62,29 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
       })
       res.end()
+      return
+    }
+
+    // Optional client authentication (API_KEY). Health/landing stays public;
+    // /v1/* and the /__* debug endpoints require the key when it is configured.
+    if (!isPublicPath(path) && !isAuthorized(req)) {
+      const body = JSON.stringify({
+        error: {
+          message: 'Invalid API key. Send it as `Authorization: Bearer <API_KEY>` (the relay\'s API_KEY env var).',
+          type: 'invalid_request_error',
+          code: 'invalid_api_key',
+        },
+      })
+      res.writeHead(401, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'WWW-Authenticate': 'Bearer',
+        'Access-Control-Allow-Origin': '*',
+      })
+      res.end(body)
       return
     }
 
@@ -114,6 +139,7 @@ function start() {
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1 (${RUNTIME})`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
+    console.log(`[opencode-free-provider] client auth: ${authRequired() ? 'required (API_KEY set)' : 'disabled (API_KEY unset)'}`)
     if (!IS_BUN) {
       console.warn(
         '[opencode-free-provider] WARNING: running under Node. The free tier fingerprints the outbound '

@@ -86,9 +86,10 @@ Fixes in this repo:
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server, routing, `/__session` debug endpoint, direct-run guard |
+| `server.js` | HTTP server, routing, **`API_KEY` auth gate**, `/__session` debug endpoint, direct-run guard |
 | `src/routes.js` | `/v1/models`, `/v1/models/:id`, `/v1/chat/completions`, `/__session`, `/__models` |
 | `src/models.js` | Local model registry + `opencode-free/` id prefix handling |
+| `src/auth.js` | **Optional client authentication** (`API_KEY`): parses `Authorization: Bearer` / `x-api-key`, timing-safe compare, `isPublicPath` for the health routes |
 | `src/config.js` | **Fingerprint + model registry source of truth**: re-exports the fingerprint API from `src/fingerprint.js`, UA/tool fallbacks, mandatory tools, env overrides, **live model discovery (`GET /models` → filter ids containing `big-pickle` or `-free`) with TTL cache** |
 | `src/fingerprint.js` | **Pure-JS fingerprint generation**: opencode's `descending()`/`ascending()` id algorithm (`ses_`/`msg_`), session mode (per-request/sticky), header builder (UA + `x-opencode-session` + matching `x-opencode-session-id`), fingerprint state |
 | `src/conversions.js` | OpenAI↔upstream normalization; `buildRequestBody` forces `stream:true` + injects the 4 tools; **`injectOpencodeSystemEnv`/`opencodeEnvBlock`** append OpenCode's `<env>` block (the 429 gate) inside `finalizeBody`; SSE aggregation for non-stream |
@@ -182,6 +183,7 @@ node server.js       # starts, but the free tier 429s Node's TLS hello — debug
 | `OPENCODE_UA` | `opencode/latest/2.0.22/cli` | User-Agent advertised to the free-tier gate |
 | `OPENCODE_ENV_CWD` | `/` | Working directory advertised in the injected `<env>` block (`x-opencode-directory` from the caller wins) |
 | `OPENCODE_SYSTEM_FP` | _(unset)_ | `0` disables the `<env>` block injection (free tier then answers 429) |
+| `API_KEY` | `public` (Dockerfile) | client→relay credential; unset/empty disables auth. Enforced in `server.js` for everything except `/`, `/health`, `/v1`, `/v1/` (so `/v1/*` and `/__*` are gated) |
 
 Local debug (never forwarded upstream):
 ```bash
