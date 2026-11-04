@@ -1,0 +1,94 @@
+on:
+  repository_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.vscode/**'
+  workflow_dispatch:
+    inputs:
+      arg_name:
+        description: '镜像标签, 例如 opencode-free-provider:latest'
+        required: true
+        default: 'opencode-free-provider:latest'
+      arg_registry:
+        description: '镜像仓库地址 (ghcr.io / 其它 registry)'
+        required: true
+        default: 'ghcr.io'
+      arg_user:
+        description: '镜像仓库用户名'
+        required: true
+        default: 'jcleng'
+      arg_suffix:
+        description: '追加到镜像标签后的架构后缀 (留空则不追加)'
+        required: false
+        default: '-aarch64'
+
+name: build images (aarch64) && push
+jobs:
+  buildimages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Checkout Repos
+      uses: actions/checkout@v4
+
+    # 按 https://github.com/jirutka/setup-alpine#set-up-and-use-alpine-for-a-different-cpu-architecture
+    # 准备 aarch64 的 QEMU 模拟环境 (arch: aarch64)。
+    # 该步骤注册 binfmt_misc，后续 buildx 在 arm64 平台下执行 RUN 指令时即可被模拟。
+    - name: Set up Alpine Linux for aarch64 (QEMU emulation)
+      uses: jirutka/setup-alpine@v1
+      with:
+        arch: aarch64
+        branch: latest-stable
+
+    - name: Verify aarch64 emulation
+      run: uname -m
+      shell: alpine.sh {0}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ github.event.inputs.arg_registry || 'ghcr.io' }}
+        username: ${{ github.event.inputs.arg_user || github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        logout: false
+
+    - name: Build image (linux/arm64)
+      run: |
+        IMAGE="${{ github.event.inputs.arg_registry || 'ghcr.io' }}/${{ github.event.inputs.arg_user || github.actor }}/${{ github.event.inputs.arg_name || 'opencode-free-provider:latest' }}"
+        SUFFIX="${{ github.event.inputs.arg_suffix }}"
+        # workflow_dispatch 之外的触发方式拿不到 inputs，此时使用默认后缀
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          SUFFIX="-aarch64"
+        fi
+
+        # 在标签后追加架构后缀：opencode-free-provider:latest -> opencode-free-provider:latest-aarch64
+        if [ -n "$SUFFIX" ]; then
+          case "$IMAGE" in
+            *:*) NAME="${IMAGE%:*}"; TAG="${IMAGE##*:}" ;;
+            *)   NAME="$IMAGE"; TAG="latest" ;;
+          esac
+          IMAGE="${NAME}:${TAG}${SUFFIX}"
+        fi
+
+        echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+        docker buildx build . \
+          --platform linux/arm64 \
+          --load \
+          -t "$IMAGE"
+
+    - name: Verify image architecture
+      run: |
+        docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}'
+        test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "arm64"
+
+    - name: Push image
+      run: |
+        docker push "$IMAGE"
