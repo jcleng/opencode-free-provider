@@ -1,11 +1,12 @@
+# 单架构 aarch64 镜像的按需构建入口。
+#
+# 常规发布走 build.yml —— 它一次构建 linux/amd64 + linux/arm64 并推送多架构
+# manifest list, `docker pull …:latest` 会按本机架构自动选择。
+#
+# 本 workflow 只用于需要「独立的 arm64 单架构标签」的场景 (例如给
+# 只认单架构 manifest 的老 registry / 老 docker 使用, 或调试 arm64 产物),
+# 因此**不监听 push**, 只能手动触发, 避免与 build.yml 争用同一个 latest 标签。
 on:
-  repository_dispatch:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - '.vscode/**'
   workflow_dispatch:
     inputs:
       arg_name:
@@ -21,11 +22,11 @@ on:
         required: true
         default: 'jcleng'
       arg_suffix:
-        description: '追加到镜像标签后的架构后缀 (留空则不追加)'
-        required: false
+        description: '追加到镜像标签后的架构后缀'
+        required: true
         default: '-aarch64'
 
-name: build images (aarch64) && push
+name: build aarch64 image && push (manual)
 jobs:
   buildimages:
     runs-on: ubuntu-latest
@@ -37,12 +38,11 @@ jobs:
       uses: actions/checkout@v4
 
     # 按 https://github.com/jirutka/setup-alpine#set-up-and-use-alpine-for-a-different-cpu-architecture
-    # 准备 aarch64 的 QEMU 模拟环境 (arch: aarch64)，并注册 binfmt，
-    # 使后续 buildx 在 arm64 平台下执行 RUN 指令时能被模拟。
+    # 使用 arch: aarch64 准备 aarch64 的 Alpine chroot 模拟环境。
     #
     # 注意：不使用 `uses: jirutka/setup-alpine@v1`，因为其 composite step 执行的是
-    # `sudo -E ./setup-alpine.sh`；部分 sudo 配置会忽略 -E（本 job 首次运行日志即为
-    # "sudo: preserving the entire environment is not supported, '-E' is ignored"），
+    # `sudo -E ./setup-alpine.sh`；runner 的 sudo 会忽略 -E
+    # ("sudo: preserving the entire environment is not supported, '-E' is ignored")，
     # 导致 INPUT_* 变量丢失并在 `set -u` 下报 unbound variable。
     # 这里 clone 同一份 action 源码（脚本需用到其 keys/、binfmts/、alpine.sh 等），
     # 并用 `sudo env` 显式传入全部 INPUT_* 参数。
@@ -98,10 +98,6 @@ jobs:
       run: |
         IMAGE="${{ github.event.inputs.arg_registry || 'ghcr.io' }}/${{ github.event.inputs.arg_user || github.actor }}/${{ github.event.inputs.arg_name || 'opencode-free-provider:latest' }}"
         SUFFIX="${{ github.event.inputs.arg_suffix }}"
-        # workflow_dispatch 之外的触发方式拿不到 inputs，此时使用默认后缀
-        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          SUFFIX="-aarch64"
-        fi
 
         # 在标签后追加架构后缀：opencode-free-provider:latest -> opencode-free-provider:latest-aarch64
         if [ -n "$SUFFIX" ]; then
@@ -123,6 +119,8 @@ jobs:
         docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}'
         test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "arm64"
 
+    - name: Smoke test
+      run: docker run --rm --platform linux/arm64 "$IMAGE" bun -e 'console.log(process.platform, process.arch)'
+
     - name: Push image
-      run: |
-        docker push "$IMAGE"
+      run: docker push "$IMAGE"
