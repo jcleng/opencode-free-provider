@@ -94,6 +94,7 @@ Fixes in this repo:
 | `src/fingerprint.js` | **Pure-JS fingerprint generation**: opencode's `descending()`/`ascending()` id algorithm (`ses_`/`msg_`), session mode (per-request/sticky), header builder (UA + `x-opencode-session` + matching `x-opencode-session-id`), fingerprint state |
 | `src/conversions.js` | OpenAI↔upstream normalization; `buildRequestBody` forces `stream:true` + injects the 4 tools; **`injectOpencodeSystemEnv`/`opencodeEnvBlock`** append OpenCode's `<env>` block (the 429 gate) inside `finalizeBody`; SSE aggregation for non-stream |
 | `src/upstream.js` | **Request injection + relay**: builds fingerprint headers (from `config.getFingerprintHeaders`), threads `systemEnv` into every upstream body (initial + follow-up turns), POSTs upstream, aggregates SSE→JSON for non-stream |
+| `src/ipinfo.js` | **Startup client-IP diagnostic**: fire-and-forget `GET https://ipinfo.io/json` at boot, prints the raw response (ip/city/region/country/loc/org/postal/timezone) + a one-line summary; never fatal, `IPINFO_DISABLED=1` disables |
 
 ## Maintenance philosophy (read this before "fixing" a 403 or a 429)
 
@@ -184,12 +185,23 @@ node server.js       # starts, but the free tier 429s Node's TLS hello — debug
 | `OPENCODE_ENV_CWD` | `/` | Working directory advertised in the injected `<env>` block (`x-opencode-directory` from the caller wins) |
 | `OPENCODE_SYSTEM_FP` | _(unset)_ | `0` disables the `<env>` block injection (free tier then answers 429) |
 | `API_KEY` | `public` (Dockerfile) | client→relay credential; unset/empty disables auth. Enforced in `server.js` for everything except `/`, `/health`, `/v1`, `/v1/` (so `/v1/*` and `/__*` are gated) |
+| `IPINFO_DISABLED` | _(unset)_ | `1` skips the startup client-IP lookup |
+| `IPINFO_URL` | `https://ipinfo.io/json` | endpoint queried at startup |
+| `IPINFO_TIMEOUT_MS` | `5000` | timeout for the startup IP lookup |
 
 Local debug (never forwarded upstream):
 ```bash
 curl http://127.0.0.1:8791/__session
 curl http://127.0.0.1:8791/__models      # ?refresh=1 forces a re-fetch
 ```
+
+At startup the relay also prints the host's egress IP info (`src/ipinfo.js`):
+```
+[opencode-free-provider] client ip info (https://ipinfo.io/json): {"ip":"111.10.182.15","city":"Chongqing",...}
+[opencode-free-provider] client ip summary: ip=111.10.182.15 — Chongqing, Chongqing, CN | AS9808 China Mobile… | Asia/Shanghai
+```
+It is fire-and-forget (a blocked network only logs a warning) and can be
+disabled with `IPINFO_DISABLED=1`.
 
 ## Connect an agent
 

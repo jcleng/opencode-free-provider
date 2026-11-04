@@ -40,6 +40,7 @@ import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
 import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
 import { authRequired, isAuthorized, isPublicPath } from './src/auth.js'
+import { logClientIpInfo } from './src/ipinfo.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
@@ -140,6 +141,11 @@ function start() {
     console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1 (${RUNTIME})`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
     console.log(`[opencode-free-provider] client auth: ${authRequired() ? 'required (API_KEY set)' : 'disabled (API_KEY unset)'}`)
+    // Startup diagnostic: print this host's egress IP + geo/ASN (ipinfo.io).
+    // Fire-and-forget so a blocked network never delays or blocks startup;
+    // disable with IPINFO_DISABLED=1, override the endpoint with IPINFO_URL.
+    logClientIpInfo()
+
     if (!IS_BUN) {
       console.warn(
         '[opencode-free-provider] WARNING: running under Node. The free tier fingerprints the outbound '
