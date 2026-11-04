@@ -37,17 +37,51 @@ jobs:
       uses: actions/checkout@v4
 
     # 按 https://github.com/jirutka/setup-alpine#set-up-and-use-alpine-for-a-different-cpu-architecture
-    # 准备 aarch64 的 QEMU 模拟环境 (arch: aarch64)。
-    # 该步骤注册 binfmt_misc，后续 buildx 在 arm64 平台下执行 RUN 指令时即可被模拟。
+    # 准备 aarch64 的 QEMU 模拟环境 (arch: aarch64)，并注册 binfmt，
+    # 使后续 buildx 在 arm64 平台下执行 RUN 指令时能被模拟。
+    #
+    # 注意：不使用 `uses: jirutka/setup-alpine@v1`，因为其 composite step 执行的是
+    # `sudo -E ./setup-alpine.sh`；部分 sudo 配置会忽略 -E（本 job 首次运行日志即为
+    # "sudo: preserving the entire environment is not supported, '-E' is ignored"），
+    # 导致 INPUT_* 变量丢失并在 `set -u` 下报 unbound variable。
+    # 这里 clone 同一份 action 源码（脚本需用到其 keys/、binfmts/、alpine.sh 等），
+    # 并用 `sudo env` 显式传入全部 INPUT_* 参数。
     - name: Set up Alpine Linux for aarch64 (QEMU emulation)
-      uses: jirutka/setup-alpine@v1
-      with:
-        arch: aarch64
-        branch: latest-stable
+      run: |
+        git clone --depth 1 --branch v1 https://github.com/jirutka/setup-alpine.git "$RUNNER_TEMP/setup-alpine"
+        sudo env \
+          SUDO_USER="$USER" SUDO_UID="$(id -u)" SUDO_GID="$(id -g)" \
+          GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+          GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+          GITHUB_PATH="$GITHUB_PATH" \
+          RUNNER_TEMP="$RUNNER_TEMP" \
+          INPUT_APK_TOOLS_URL='https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v2.14.10/x86_64/apk.static#!sha256!34bb1a96f0258982377a289392d4ea9f3f4b767a4bb5806b1b87179b79ad8a1c' \
+          INPUT_ARCH='aarch64' \
+          INPUT_BRANCH='latest-stable' \
+          INPUT_EXTRA_KEYS='' \
+          INPUT_EXTRA_REPOSITORIES='' \
+          INPUT_MIRROR_URL='http://dl-cdn.alpinelinux.org/alpine' \
+          INPUT_PACKAGES='' \
+          INPUT_SHELL_NAME='alpine.sh' \
+          INPUT_VOLUMES='' \
+          bash "$RUNNER_TEMP/setup-alpine/setup-alpine.sh"
+
+        # 作为 composite action 时 GITHUB_OUTPUT/GITHUB_PATH 由 runner 设置；
+        # 直接调用脚本时需要手动把 chroot 的 abin 加入 PATH。
+        ROOTFS=$(sed -n 's/^root-path=//p' "$GITHUB_OUTPUT" | tail -1)
+        echo "$ROOTFS/abin" >> "$GITHUB_PATH"
+        echo "ALPINE_ROOT_PATH=$ROOTFS" >> "$GITHUB_ENV"
 
     - name: Verify aarch64 emulation
       run: uname -m
       shell: alpine.sh {0}
+
+    # setup-alpine 只提供 Alpine chroot 的 aarch64 模拟；buildx 构建 arm64 镜像
+    # 还需要 binfmt_misc 中注册 qemu-aarch64，否则 RUN 会报 exec format error。
+    - name: Set up QEMU (binfmt for arm64)
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
