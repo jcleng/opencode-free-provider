@@ -9,7 +9,7 @@ import {
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
   normalizeToolArguments, shapeCompletion,
 } from './conversions.js'
-import { pickEgress, reportEgress, ensureEgress } from './egress.js'
+import { pickEgress, reportEgress, ensureEgress, recordRequest, recordBytes } from './egress.js'
 
 function resolveApiKey() {
   return process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_G_API_KEY || LITERAL_KEY
@@ -159,6 +159,8 @@ export async function* relayChatCompletions(opts) {
     let response
     try {
       const body = { ...baseBody, messages: wireMessages, model: turnModel }
+      const bodyBytes = Buffer.byteLength(JSON.stringify(body))
+      recordBytes(bodyBytes, 0)
       const init = {
         method: 'POST',
         headers: fingerprintHeaders(fpHeaders),
@@ -186,6 +188,7 @@ export async function* relayChatCompletions(opts) {
     }
 
     const ctype = response.headers.get('content-type') || ''
+    recordBytes(0, Number(response.headers.get('content-length') || 0))
     try {
       // Fully consume the upstream stream (this is where a mid-stream connection
       // drop surfaces) and translate fingerprint tool calls for the agent.
@@ -224,11 +227,13 @@ export async function* relayChatCompletions(opts) {
       if (proxy) {
         if (err.code === 'RATE_LIMITED') {
           reportEgress(proxy, 'quota', { retryAfterSec: err.retryAfterSec })
+          recordRequest({ viaProxy: true, outcome: 'quota', rotated: true })
           console.warn(`[opencode-free-provider] egress ${proxy} quota-exhausted (retry-after ${err.retryAfterSec}s); rotating IP`)
           continue // fresh IP: no backoff
         }
         if (err.code === 'TRANSPORT' || isRetryableUpstreamError(err)) {
           reportEgress(proxy, 'dead', { detail: err.message })
+          recordRequest({ viaProxy: true, outcome: 'dead' })
           console.warn(`[opencode-free-provider] egress ${proxy} dead (${err.message}); rotating IP`)
           continue
         }
@@ -240,9 +245,11 @@ export async function* relayChatCompletions(opts) {
         // FAST ROTATION: inline quick-probe up to 3 fresh candidates right now.
         const fresh = await ensureEgress({ quick: 3 })
         if (fresh) {
+          recordRequest({ viaProxy: false, outcome: 'quota', rotated: true })
           console.warn(`[opencode-free-provider] direct egress quota-exhausted; fast-rotated to ${fresh}`)
           continue
         }
+        recordRequest({ viaProxy: false, outcome: 'quota' })
         const e = new Error('OpenCode Zen free quota exhausted on this IP and no verified egress proxy is available; the background sweep re-tests the pool and dustbin entries return after their retry-after')
         e.code = 'RATE_LIMITED'
         e.status = 429
@@ -259,6 +266,7 @@ export async function* relayChatCompletions(opts) {
     }
 
     if (proxy) reportEgress(proxy, 'ok')
+    recordRequest({ viaProxy: !!proxy, outcome: 'ok' })
     if (!stream) { yield completion; return }
     if (completion) yield* completionToChunks(completion)
     return

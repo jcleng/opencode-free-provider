@@ -24,7 +24,7 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull, handleEgressSet } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull, handleEgressSet, handleEgressSweepNow } from './src/routes.js'
 import { startSweeper } from './src/egress.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
@@ -121,6 +121,11 @@ const server = http.createServer(async (req, res) => {
     // /__egress/set — { on } master switch (off = force direct connection).
     if (method === 'POST' && path === '/__egress/set') {
       return await handleEgressSet(req, res)
+    }
+
+    // /__egress/sweep-now — force a sweep immediately (background timer also runs).
+    if (method === 'POST' && path === '/__egress/sweep-now') {
+      return await handleEgressSweepNow(req, res)
     }
 
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })

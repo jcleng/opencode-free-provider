@@ -36,6 +36,15 @@ export function egressDashboardHtml() {
   .card.ok .n { color: var(--ok) } .card.warn .n { color: var(--warn) } .card.bad .n { color: var(--bad) }
   .best { grid-column: 1 / -1; font-size: 13px; color: var(--dim) }
   .best b { color: var(--ok) }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px }
+  .stat .n { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums }
+  .stat .l { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .8px; margin-top: 2px }
+  .stat.ok .n { color: var(--ok) } .stat.warn .n { color: var(--warn) } .stat.bad .n { color: var(--bad) }
+  .spark { width: 100%; height: 56px; margin-top: 6px }
+  .events { font-size: 12px; color: var(--dim); max-height: 160px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel); margin-top: 10px }
+  .events div { padding: 1px 0 }
+  .events b { color: var(--text) }
   section { background: var(--panel); border: none; border-radius: var(--radius); padding: var(--pad); margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.06) }
   @media (prefers-color-scheme: dark) { section { box-shadow: none } }
   section h2 { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 0 0 10px }
@@ -101,6 +110,13 @@ export function egressDashboardHtml() {
   <div class="cards" id="cards"></div>
 
   <section>
+    <h2>Live decisions</h2>
+    <div class="stats-grid" id="statsGrid"></div>
+    <svg class="spark" id="spark" viewBox="0 0 100 56" preserveAspectRatio="none"></svg>
+    <div class="events" id="events"></div>
+  </section>
+
+  <section>
     <h2>My proxies (preferred in rotation, never auto-culled)</h2>
     <table id="userTable"><thead><tr><th></th><th>proxy</th><th>status</th><th>ttfb</th><th></th></tr></thead><tbody></tbody></table>
     <div class="hint">User-added proxies rotate before scraped ones and survive sweeper culling.</div>
@@ -139,8 +155,10 @@ const api = (path, opts) => fetch(path, { headers: { 'content-type': 'applicatio
 async function refresh() {
   const j = await (await fetch('/__egress')).json();
   const e = j.egress;
+  const state = await fetch('/__egress/full').then(r => r.ok ? r.json() : null);
   renderCards(e);
   renderMode(e);
+  renderStats(state && state.stats ? state.stats : null);
   // full state comes from /__egress + the table payloads below
   const state = await fetch('/__egress/full').then(r => r.ok ? r.json() : null);
   const pools = state?.pool || e.top || [];
@@ -164,6 +182,42 @@ function renderMode(e) {
 async function setMode(on) {
   await api('/__egress/set', { method: 'POST', body: JSON.stringify({ on }) });
   refresh();
+}
+
+function renderStats(st) {
+  const el = $('#statsGrid');
+  if (!el) return;
+  if (!st) { el.innerHTML = '<div style="color:var(--dim);grid-column:1/-1">no stats yet — relay a request</div>'; return; }
+  const tiles = [
+    { n: st.requests ?? 0, l: 'requests' },
+    { n: st.ok ?? 0, l: 'ok', c: 'ok' },
+    { n: st.quota ?? 0, l: 'quota hits', c: (st.quota ?? 0) ? 'warn' : '' },
+    { n: st.dead ?? 0, l: 'dead', c: (st.dead ?? 0) ? 'bad' : '' },
+    { n: st.viaProxy ?? 0, l: 'via pool' },
+    { n: st.directFallbacks ?? 0, l: 'direct' },
+    { n: st.rotations ?? 0, l: 'rotations' },
+    { n: st.recoveries ?? 0, l: 'recoveries', c: (st.recoveries ?? 0) ? 'ok' : '' },
+  ];
+  el.innerHTML = tiles.map(c => '<div class="stat ' + (c.c || '') + '"><div class="n">' + c.n + '</div><div class="l">' + c.l + '</div></div>').join('');
+  const spark = $('#spark');
+  if (spark && Array.isArray(st.series) && st.series.length >= 2) {
+    const w = 100, h = 56, n2 = st.series.length;
+    const max = Math.max(1, ...st.series.map(p => Math.max(p.ok || 0, p.quota || 0, p.dead || 0)));
+    const xs = i => (i / (n2 - 1)) * w;
+    const ys = v => h - 4 - (v / max) * (h - 10);
+    const pts = key => st.series.map((p, i) => xs(i).toFixed(2) + ',' + ys(p[key] || 0).toFixed(2)).join(' ');
+    spark.innerHTML =
+      '<polyline points="' + pts('ok') + '" fill="none" stroke="var(--ok)" stroke-width="1.5" stroke-opacity=".9"/>'
+      + '<polyline points="' + pts('quota') + '" fill="none" stroke="var(--warn)" stroke-width="1.5" stroke-opacity=".8"/>'
+      + '<polyline points="' + pts('dead') + '" fill="none" stroke="var(--bad)" stroke-width="1.5" stroke-opacity=".8"/>';
+  } else if (spark) {
+    spark.innerHTML = '<text x="50" y="30" text-anchor="middle" font-size="4" fill="var(--dim)">needs ≥2 relay turns</text>';
+  }
+  const ev = $('#events');
+  if (ev) {
+    const es = (st.events || []).slice(-14).reverse();
+    ev.innerHTML = es.map(e => '<div><b>' + new Date(e.at).toLocaleTimeString() + '</b> · ' + e.kind + ': ' + ((e.detail || '').slice(0, 140)) + '</div>').join('');
+  }
 }
 
 function renderCards(e) {

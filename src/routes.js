@@ -4,6 +4,7 @@ import { listModelsPayload, isValidModel, findModel, splitModelId } from './mode
 import { relayChatCompletions } from './upstream.js'
 import {
   egressState, egressFullState, importProxies, toggleProxy, retestProxy, removeUserProxy, setEgressOn,
+  sweep, maskProxy, PROXY_FILE,
 } from './egress.js'
 import { egressDashboardHtml } from './egress-dashboard.js'
 
@@ -118,6 +119,14 @@ export async function handleEgressSet(req, res) {
   try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
   const r = setEgressOn(parsed.on)
   return sendJson(res, 200, { ...r, mode: r.egressOn ? 'pool-rotation' : 'direct-only' })
+}
+
+// POST /__egress/sweep-now { size, scrape } — force a sweep immediately.
+export async function handleEgressSweepNow(req, res) {
+  let parsed
+  try { parsed = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8')) } catch { parsed = {} }
+  const r = await sweep({ size: Number(parsed.size) || 30, scrape: parsed.scrape !== false })
+  return sendJson(res, 200, r)
 }
 
 export async function handleModel(req, res, id) {

@@ -2,6 +2,7 @@
 node_modules/
 egress-pool.json
 egress-dustbin.json
+egress-user.json
 server.pid
 server.log
 .oc-headers.sh

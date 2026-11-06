@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import os from 'node:os'
 import { ProxyAgent } from 'undici'
 
 import { getOpencodeBase, LITERAL_KEY } from './config.js'
@@ -44,6 +45,11 @@ export const FAST_MIN_UPTIME = Number(process.env.EGRESS_FAST_MIN_UPTIME) || 90
 export const DEAD_RETEST_MS = Number(process.env.EGRESS_DEAD_RETEST_MS) || 30 * 60_000
 // max pool entries kept
 export const POOL_MAX = Number(process.env.EGRESS_POOL_MAX) || 400
+// Optional file of proxy lines (user:pass@host:port) to auto-import as the
+// preferred user pool on startup (e.g. ~/proxy.txt). Defaults to
+// ~/proxy.txt; override with EGRESS_PROXY_FILE.
+export const PROXY_FILE = process.env.EGRESS_PROXY_FILE
+  || path.join(os.homedir(), 'proxy.txt')
 
 const SCRAPE_SOURCES = [
   {
@@ -128,18 +134,31 @@ function loadState() {
   } catch { /* start empty */ }
 }
 
-function persist() {
-  if (saving) return
-  saving = true
+function writeSync() {
   try {
     writeFileSync(POOL_FILE, JSON.stringify({ savedAt: Date.now(), entries: pool }, null, 1) + '\n')
     writeFileSync(DUSTBIN_FILE, JSON.stringify({ savedAt: Date.now(), entries: dustbin }, null, 1) + '\n')
     writeFileSync(USER_FILE, JSON.stringify({ savedAt: Date.now(), proxies: userProxies, disabled: [...disabled], egressOn }, null, 1) + '\n')
   } catch (e) {
     console.error(`[egress] persist failed: ${e?.message}`)
-  } finally {
-    saving = false
   }
+}
+let persistTimer = null
+export function flushPersist() {
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+    writeSync()
+  }
+}
+function persist() {
+  if (saving) return
+  if (persistTimer) return // already scheduled inside the window
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    writeSync()
+  }, 120)
+  if (persistTimer.unref) persistTimer.unref()
 }
 
 // --- scraping ----------------------------------------------------------------
@@ -230,10 +249,15 @@ export async function scrapeSources({ timeoutMs = 30_000 } = {}) {
       const proxies = src.parse(body)
       console.log(`[egress] scrape ${src.name}: ${proxies.length} fast http proxies`)
       found.push(...proxies)
+      scrapeStats = scrapeStats.filter((s) => s.name !== src.name)
+      scrapeStats.push({ name: src.name, count: proxies.length, at: Date.now(), ok: true })
     } catch (e) {
       console.warn(`[egress] scrape ${src.name} failed: ${e?.message}`)
+      scrapeStats = scrapeStats.filter((s) => s.name !== src.name)
+      scrapeStats.push({ name: src.name, count: 0, at: Date.now(), ok: false, error: e?.message })
     }
   }
+  pushEvent('scrape', `web: ${scrapeStats.reduce((a, s) => a + s.count, 0)} fast proxies from ${scrapeStats.filter((s) => s.ok).length}/${scrapeStats.length} sources`)
   return [...new Set(found)]
 }
 
@@ -321,8 +345,10 @@ function isDustbinned(proxyUrl) {
 }
 
 // --- user proxies ("my" free-tier proxies) + toggles + import ---------------
-// Normalize a user-supplied proxy reference into an http(s)://ip:port URL.
-// Accepts `ip:port`, `http://ip:port`, trailing junk; rejects anything else.
+// Normalize a user-supplied proxy reference to a canonical http(s) URL,
+// PRESERVING any user:pass credentials (authenticated pools, e.g.
+// `user:pass@host:port` lines from a proxy.txt). Accepts bare `host:port`,
+// `user:pass@host:port`, or a full URL; rejects anything without host+port.
 export function normalizeProxyInput(input) {
   let s = String(input || '').trim()
   if (!s) return null
@@ -331,9 +357,20 @@ export function normalizeProxyInput(input) {
     const u = new URL(s)
     if (!/^(http:|https:)$/.test(u.protocol)) return null
     if (!u.hostname || !u.port) return null
-    return `${u.protocol}//${u.hostname}:${u.port}`
+    return u.href // keeps userinfo (user:pass) when present
   } catch {
     return null
+  }
+}
+
+// Sanitize a proxy URL for display: mask the password, keep user + host:port.
+export function maskProxy(url) {
+  try {
+    const u = new URL(String(url || ''))
+    if (u.password) u.password = '••••'
+    return u.href
+  } catch {
+    return String(url || '')
   }
 }
 
@@ -466,16 +503,22 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
     ].slice(0, size)
     if (!targets.length) return { tested: 0 }
 
-    let ok = 0, quota = 0, dead = 0
+    let ok = 0, quota = 0, dead = 0, recovered = 0
     const results = await Promise.all(targets.map((p) => testProxy(p)))
     for (const r of results) {
       if (r.status === 'ok') {
+        const wasDusted = isDustbinned(r.proxy) || pool.find((e) => e.proxy === r.proxy && e.status === 'ok')
         const e = upsertPool(r.proxy, 'sweep')
         e.status = 'ok'
         e.ttfbMs = r.ttfbMs
         e.verifiedAt = Date.now()
         e.ok++
         ok++
+        if (wasDusted) {
+          recovered++
+          stats.recoveries++
+          dustbin = dustbin.filter((d) => d.proxy !== r.proxy)
+        }
       } else {
         dustbinProxy(r.proxy, r.status, { detail: r.detail, retryAfterSec: r.retryAfterSec })
         if (r.status === 'quota') quota++
@@ -486,6 +529,9 @@ export async function sweep({ size = SWEEP_CONCURRENCY, scrape = true } = {}) {
     if (pool.length > POOL_MAX) pool = pool.slice(0, POOL_MAX)
     persist()
     lastSweep = { at: Date.now(), tested: targets.length, ok, quota, dead }
+    if (ok || recovered) pushEvent('recovery', `${ok} verified ok, ${recovered} returned from dustbin`)
+    if (dead) pushEvent('dead', `${dead} proxies dustbinned dead`)
+    if (quota) pushEvent('quota', `${quota} proxies quota-exhausted (dustbinned until retry-after)`)
     console.log(`[egress] sweep: tested ${targets.length} → ok ${ok}, quota ${quota}, dead ${dead}`)
     return lastSweep
   } finally {
@@ -507,31 +553,59 @@ export async function ensureEgress({ quick = 3 } = {}) {
     const added = addCandidates(fresh, 'scrape')
     if (added) console.log(`[egress] fast-rotate: scraped +${added} fresh candidates on demand`)
   }
-  let tried = 0
-  while (tried < quick) {
-    const candidate = pool.find((e) => e.status === 'untested' && !isDustbinned(e.proxy))
-    if (!candidate) break
-    tried++
-    const r = await testProxy(candidate.proxy)
-    if (r.status === 'ok') {
-      const e = upsertPool(r.proxy, 'quick')
-      e.status = 'ok'
-      e.ttfbMs = r.ttfbMs
-      e.verifiedAt = Date.now()
-      e.ok++
-      persist()
-      console.log(`[egress] fast-rotate: ${r.proxy} verified ok (${r.ttfbMs}ms)`)
-      return r.proxy
-    }
-    dustbinProxy(r.proxy, r.status, { detail: r.detail, retryAfterSec: r.retryAfterSec })
+  // probe untested candidates in parallel (fast decisions); first ok wins
+  const candidates = pool.filter((e) => e.status === 'untested' && !isDustbinned(e.proxy)).slice(0, quick)
+  if (!candidates.length) { persist(); return pickEgress() }
+  const results = await Promise.all(candidates.map((c) => testProxy(c.proxy).catch(() => ({ proxy: c.proxy, status: 'dead', detail: 'probe-threw' }))))
+  const ok = results.find((r) => r.status === 'ok')
+  const dead = results.filter((r) => r.status !== 'ok')
+  const now = Date.now()
+  for (const r of dead) {
+    const e = upsertPool(r.proxy, 'quick')
+    if (r.status === 'quota') dustbinProxy(r.proxy, 'quota', { retryAfterSec: r.retryAfterSec })
+    else dustbinProxy(r.proxy, 'dead', { detail: r.detail })
+  }
+  if (ok) {
+    const e = upsertPool(ok.proxy, 'quick')
+    e.status = 'ok'
+    e.ttfbMs = ok.ttfbMs
+    e.verifiedAt = now
+    e.ok++
+    persist()
+    console.log(`[egress] fast-rotate: ${ok.proxy} verified ok (${ok.ttfbMs}ms)`)
+    return ok.proxy
   }
   persist()
   return pickEgress()
 }
 
+// Auto-import a local proxy file (one `user:pass@host:port` or `host:port`
+// per line; # comments and blanks ignored). Runs once at startup so the
+// operator's own pool is preferred from the first relay. Missing file is a
+// no-op.
+export async function importProxyFile(filePath = PROXY_FILE) {
+  if (!filePath) return { imported: 0, missing: true }
+  try {
+    const { readFileSync: rfs, existsSync: xs } = await import('node:fs')
+    if (!xs(filePath)) return { imported: 0, missing: true, path: filePath }
+    const r = importProxies(rfs(filePath, 'utf8'))
+    console.log(`[egress] imported ${r.added} proxies from ${filePath} (${r.invalid.length} invalid lines)`)
+    return { imported: r.added, missing: false, path: filePath, invalid: r.invalid }
+  } catch (e) {
+    console.warn(`[egress] proxy file import failed (${filePath}): ${e?.message}`)
+    return { imported: 0, missing: false, path: filePath, error: e?.message }
+  }
+}
+
 export function startSweeper() {
   let timer = null
   const tick = async () => {
+    // one-time: import the operator's own proxy file (EGRESS_PROXY_FILE) so
+    // the preferred pool is in place before the first relay.
+    if (!startSweeper._imported) {
+      startSweeper._imported = true
+      await importProxyFile()
+    }
     const r = await sweep().catch((e) => {
       console.warn(`[egress] sweep error: ${e?.message}`)
       return null
@@ -580,7 +654,8 @@ export function pickEgress() {
 }
 
 // Called by the relay when a real request succeeded / failed on a proxy, so the
-// pool reflects live reality between sweeps.
+// pool reflects live reality between sweeps. Pure pool bookkeeping; stats are
+// recorded separately by recordRequest().
 export function reportEgress(proxyUrl, outcome, { retryAfterSec } = {}) {
   if (!proxyUrl) return
   if (outcome === 'ok') {
@@ -590,6 +665,7 @@ export function reportEgress(proxyUrl, outcome, { retryAfterSec } = {}) {
     e.ok++
     e.fail = 0
   } else if (outcome === 'quota') {
+    pushEvent('rotation', maskProxy(proxyUrl) + ' quota-exhausted; rotating')
     dustbinProxy(proxyUrl, 'quota', { retryAfterSec })
   } else {
     const e = findPool(proxyUrl)
@@ -597,6 +673,62 @@ export function reportEgress(proxyUrl, outcome, { retryAfterSec } = {}) {
     dustbinProxy(proxyUrl, 'dead', { detail: outcome })
   }
   persist()
+}
+
+// --- live stats (KPI tiles + sparklines for the dashboard) -------------------
+const stats = {
+  requests: 0,        // relay turns attempted through a proxy
+  viaProxy: 0,       // turns that actually used a proxy
+  directFallbacks: 0, // turns that fell back to the direct connection
+  ok: 0,
+  quota: 0,
+  dead: 0,
+  rotations: 0,       // egress→direct flips triggered by a 429
+  recoveries: 0,      // quota-dusted IPs verified ok again on retest
+  bytesIn: 0,
+  bytesOut: 0,
+  series: [],         // rolling { at, ok, quota, dead } for the sparkline
+}
+const SERIES_MAX = 240
+
+// Rolling event ring for the dashboard "events" tab (sweeps, rotations,
+// dustbin/recoveries, imports). Newest last.
+const events = []
+const EVENTS_MAX = 200
+export function pushEvent(kind, detail) {
+  events.push({ at: Date.now(), kind, detail: detail || '' })
+  if (events.length > EVENTS_MAX) events.shift()
+}
+
+// Per-source scrape results for the "sources" strip ({ name, count, at }).
+let scrapeStats = []
+
+function recordEgress(outcome, origin) {
+  if (outcome === 'ok') stats.ok++
+  else if (outcome === 'quota') stats.quota++
+  else stats.dead++
+  if (origin === 'direct') stats.directFallbacks++
+  else stats.viaProxy++
+}
+
+export function recordRequest({ viaProxy, outcome, rotated } = {}) {
+  stats.requests++
+  recordEgress(outcome || 'ok', viaProxy ? 'proxy' : 'direct')
+  if (rotated || (viaProxy && outcome === 'quota')) stats.rotations++
+  const now = Date.now()
+  stats.series.push({ at: now, ok: stats.ok, quota: stats.quota, dead: stats.dead })
+  if (stats.series.length > SERIES_MAX) stats.series.shift()
+}
+
+export function statsSnapshot() {
+  return { ...stats, series: stats.series, events: events.slice(-80), scrapeStats }
+}
+
+// Record in/out byte volume for the "Data moved" KPI (call from the relay with
+// the request + response body sizes).
+export function recordBytes(inBytes = 0, outBytes = 0) {
+  stats.bytesIn += Number(inBytes) || 0
+  stats.bytesOut += Number(outBytes) || 0
 }
 
 export function egressState() {
@@ -622,8 +754,13 @@ export function egressState() {
 // Complete state for the dashboard: every pool entry, user proxies, disabled
 // set and the dustbin (capped for transport).
 export function egressFullState() {
+  const quotaEntries = dustbin.filter((d) => d.reason === 'quota')
+  const nextQuotaReturn = quotaEntries.length ? Math.min(...quotaEntries.map((d) => d.retestAt)) : null
   return {
     ...egressState(),
+    stats: statsSnapshot(),
+    proxyFile: PROXY_FILE || null,
+    nextQuotaReturn,
     pool: pool.map((e) => ({ ...e, mine: userProxies.includes(e.proxy) })),
     user: userProxies.map((p) => ({ proxy: p, disabled: disabled.has(p) })),
     disabled: [...disabled],
