@@ -18,6 +18,14 @@ fast HTTP proxies scraped from the web are kept in a verified pool, and when the
 direct connection (or the current proxy) hits `429 FreeUsageLimitError`, requests
 rotate to the next usable egress IP automatically.
 
+Identity rotates together with the IP: every egress rotation also re-mints the
+opencode fingerprint — a fresh `x-opencode-session` id (and, per attempt, a fresh
+`x-opencode-request`) — so a new IP never reuses a session the old IP already
+carried (`rotateSession()`, src/fingerprint.js). This reuses a session on the
+**client-gate** 429 (FreeUsageLimitError-family) rather than rotating: that one
+deterministically follows the client until its reset time, so the relay fails
+fast instead of burning the pool on IP moves.
+
 ## Why a proxy is needed
 
 `opencode.ai/inference/openai/v1` enforces a **client-fingerprint gate**: a bare request is
