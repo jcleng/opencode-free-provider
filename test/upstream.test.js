@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { relayChatCompletions } from '../src/upstream.js'
+import { relayChatCompletions, resetQuotaState, quotaState } from '../src/upstream.js'
 import { encodeTranslatedId } from '../src/conversions.js'
 
 // Fake upstream that (a) on a turn WITHOUT a tool result returns a configurable
@@ -14,6 +14,7 @@ let firstTurnCalls = [] // [{ name, args }]
 let requestCount = 0
 let lastWireBody = null
 let destroyFirstN = 0 // simulate N connection resets (fetch failed) before succeeding
+let quota429 = false // simulate the free-tier daily budget being exhausted
 
 function sse(res, obj) {
   res.write('data: ' + JSON.stringify(obj) + '\n\n')
@@ -48,6 +49,17 @@ before(async () => {
       req.on('data', (c) => (body += c))
       req.on('end', () => {
         requestCount++
+        if (quota429) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '3600' })
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'FreeUsageLimitError',
+              message: 'Free usage limit reached. Free models work in OpenCode; subscribe to OpenCode Go to keep going: https://opencode.ai/go',
+            },
+          }))
+          return
+        }
         if (destroyFirstN > 0) {
           // Simulate a connection-level failure (ECONNRESET / "fetch failed").
           destroyFirstN--
@@ -227,4 +239,51 @@ test('surfaces the underlying cause in the error message when all attempts fail'
   assert.match(caught.message, /fetch failed|socket|reset|ECONNRESET|stream/i,
     `error message should carry a diagnosable cause, got: ${caught.message}`)
   assert.ok(requestCount >= 2, `expected multiple retry attempts, got ${requestCount}`)
+})
+
+test('429 FreeUsageLimitError is NOT retried and opens a fail-fast cooldown', async () => {
+  // The free tier's daily budget returns 429 + FreeUsageLimitError + Retry-After
+  // (hours). Retrying after ~500ms can never succeed; the relay must surface it
+  // immediately and remember the reset time.
+  quota429 = true
+  requestCount = 0
+  const call = () => collect({
+    model: 'big-pickle',
+    messages: [{ role: 'user', content: 'scan' }],
+    tools: callerTools(['bash', 'grep', 'read']),
+    stream: false,
+  })
+
+  try {
+    let caught = null
+    try {
+      await call()
+    } catch (err) {
+      caught = err
+    }
+    assert.ok(caught, 'quota exhaustion surfaces as an error')
+    assert.equal(caught.code, 'QUOTA_EXHAUSTED')
+    assert.equal(caught.status, 429)
+    assert.equal(caught.quota, true)
+    assert.equal(caught.retryAfterMs, 3600_000, 'Retry-After header is parsed into ms')
+    assert.equal(requestCount, 1, 'must not retry a deterministic quota error')
+
+    const state = quotaState()
+    assert.equal(state.active, true)
+    assert.ok(state.resetAt, 'reset time is recorded')
+
+    // Second call must fail fast without touching upstream.
+    let second = null
+    try {
+      await call()
+    } catch (err) {
+      second = err
+    }
+    assert.ok(second)
+    assert.equal(second.code, 'QUOTA_EXHAUSTED')
+    assert.equal(requestCount, 1, 'cooldown must short-circuit before the upstream fetch')
+  } finally {
+    quota429 = false
+    resetQuotaState()
+  }
 })

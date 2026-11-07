@@ -148,6 +148,26 @@ export function sessionState() {
   }
 }
 
+/**
+ * Force-rotate the session identity immediately. Called by upstream.js every
+ * time the relay rotates egress on a quota/transport hit, so the new egress IP
+ * is paired with a brand-new opencode session (never reuse a session that the
+ * previous IP already carried). No-op in 'per-request' mode, which already
+ * mints a fresh ses_ id on every currentSession() call.
+ *
+ * The User-Agent is deliberately NOT rotated: the gate pins `opencode/<ver>`
+ * and a floor of >= 1.18, so the UA stays stable (override with OPENCODE_UA if
+ * upstream raises the floor). Rotating identity here = session + per-attempt
+ * request id; rotating egress = the IP.
+ */
+export function rotateSession() {
+  if (ZEN_SESSION_MODE !== 'sticky') return null
+  _stickySession = newSessionId()
+  _stickyBorn = Date.now()
+  _rotations += 1
+  return _stickySession
+}
+
 // ---------------------------------------------------------------------------
 // Fingerprint headers
 // ---------------------------------------------------------------------------

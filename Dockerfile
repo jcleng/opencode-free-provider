@@ -1,21 +1,30 @@
-# OpenCode Zen free-tier proxy.
+# OpenCode Zen free-tier proxy — runs on BUN.
 #
-# The proxy is pure Node with zero npm runtime deps. The upstream free-tier
-# fingerprint (User-Agent + x-opencode-session id) is generated in pure JS by
-# src/fingerprint.js — NO `opencode` CLI, NO MITM, NO openssl needed.
+# WHY BUN (not Node)
+# ------------------
+# The free tier fingerprints the outbound **TLS client hello**. The official
+# OpenCode client is a Bun binary; a request sent with Bun's TLS stack is
+# accepted, while the byte-identical request sent with Node/OpenSSL is answered
+# with
 #
-# Node >= 24 is REQUIRED: the built-in global `fetch` only honors the
-# `https_proxy`/`HTTPS_PROXY` env vars (via `NODE_USE_ENV_PROXY=1`) starting in
-# Node v24.0.0. See README "Outbound proxy".
+#   429 {"type":"error","error":{"type":"FreeUsageLimitError",
+#        "message":"Free usage limit reached. Free models work in OpenCode …"}}
+#
+# even when the egress IP still has free quota (verified by routing the very
+# same request through a TLS-terminating tunnel: Node → 429, Bun → 200). Node's
+# TLS options (ciphers / curves / sigalgs) do not change the verdict, so the only
+# reliable fix is to relay with the same runtime OpenCode itself uses.
+#
+# The proxy is still dependency-free pure JS — Bun just supplies `fetch`.
 #
 # Override the base image at build time if you mirror it, e.g.:
-#   docker build --build-arg NODE_IMAGE=registry.cn-hangzhou.aliyuncs.com/jcleng/library-node:24 .
-ARG NODE_IMAGE=node:24-bookworm-slim
-FROM ${NODE_IMAGE} AS base
+#   docker build --build-arg BUN_IMAGE=registry.cn-hangzhou.aliyuncs.com/jcleng/bun:1.4.4 .
+ARG BUN_IMAGE=oven/bun:1.4.4
+FROM ${BUN_IMAGE} AS base
 
 WORKDIR /app
 
-# ca-certificates : outbound HTTPS to opencode.ai/zen/v1
+# ca-certificates : outbound HTTPS to opencode.ai/inference/openai/v1
 # curl            : handy for health checks / debugging from inside the container
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -29,7 +38,32 @@ COPY . .
 ENV HOST=0.0.0.0
 ENV PORT=8791
 
+# Bun's fetch honors HTTPS_PROXY/HTTP_PROXY on its own; keep the Node-compat flag
+# for any code path that still consults it.
+ENV NODE_USE_ENV_PROXY=1
+
+# CLIENT→relay credential (see src/auth.js). When set, every /v1 request must
+# send `Authorization: Bearer $API_KEY` (or `x-api-key`), and agents configure
+# exactly this value as their provider `apiKey`:
+#
+#   "opencode-zen-server": {
+#     "baseUrl": "http://<host>:<port>/v1",
+#     "api": "openai-completions",
+#     "apiKey": "<API_KEY>",
+#     "models": [{ "id": "big-pickle", "contextWindow": 200000 }]
+#   }
+#
+# Default `public` keeps the historical `apiKey: public` working; override it
+# with `docker run -e API_KEY=<secret>` to lock the relay down, or pass an empty
+# value (`-e API_KEY=`) to disable client auth entirely.
+ENV API_KEY=public
+
+# Node's Happy Eyeballs gives each resolved address only 250ms to connect. The
+# opencode.ai Cloudflare edge often needs longer, which surfaced as intermittent
+# "fetch failed (ETIMEDOUT)". See src/network.js (best-effort: Bun may not expose
+# the net helper).
+ENV ZEN_CONNECT_ATTEMPT_TIMEOUT_MS=3000
+
 EXPOSE 8791
 
-# `node server.js` auto-listens because it is executed directly (import.meta.url).
-CMD ["node", "server.js"]
+CMD ["bun", "server.js"]

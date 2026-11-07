@@ -15,8 +15,8 @@ Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (o
 
 ## Why a proxy is needed (the core insight)
 
-`opencode.ai/zen/v1` enforces a **client-fingerprint gate**. A bare request is
-rejected with:
+`opencode.ai/inference/openai/v1` enforces a **client-fingerprint gate**. A bare
+request is rejected with:
 
 ```
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
@@ -40,29 +40,78 @@ opencode's `descending()` algorithm — `ses_` + 12 lowercase hex of
 
 This proxy injects every required header/field, so plain OpenAI clients just work.
 
+## The SECOND gate: 429 `FreeUsageLimitError` (runtime + system prompt)
+
+Passing the 403 gate is not enough. The free tier has a second, independent gate
+that responds with
+
+```json
+429 {"type":"error","error":{"type":"FreeUsageLimitError",
+     "message":"Free usage limit reached. Free models work in OpenCode …"}}
+```
+
+and `Retry-After` ≈ the next UTC midnight. **This is NOT a rate limit and NOT an
+IP quota** — the message is misleading. Live ablation (2026-10, same egress IP,
+same millisecond-scale window, same request bytes) pinned it to two conditions:
+
+1. **The outbound TLS client hello must look like OpenCode's (Bun).** The
+   identical request replayed through a local TLS-terminating tunnel returns
+   `200` when the TLS leg is Bun and `429` when it is Node/OpenSSL. Node's TLS
+   knobs (`ciphers`, `ecdhCurve`, `sigalgs`, ALPN, TLS1.2 vs 1.3) do **not**
+   change the verdict. Other egress IPs return the same 429, so it is not
+   per-IP.
+2. **The body's system prompt must carry OpenCode's `<env>` block.** Appending
+   the captured block to an arbitrary system prompt flips the same request to
+   `200`; removing or truncating it flips it back to `429`. The headers are
+   irrelevant here (minimal headers + real body → `200`, real headers + short
+   body → `429`).
+
+Fixes in this repo:
+
+- the process runs on **Bun** (`Dockerfile` CMD `bun server.js`, `npm start`
+  also uses Bun). `node server.js` still starts but logs a warning and every
+  chat request 429s.
+- `injectOpencodeSystemEnv` (`src/conversions.js`) appends the `<env>` block to
+  the caller's system prompt — additively (agent instructions preserved) and
+  idempotently (an OpenCode caller that already sends `<env>` is untouched) —
+  inside `finalizeBody`, so both the initial request and every follow-up turn
+  carry it. `src/routes.js` feeds it the caller's `x-opencode-directory` (or
+  `OPENCODE_ENV_CWD`), and `OPENCODE_SYSTEM_FP=0` disables it.
+
+> Symptom → cause: `429 FreeUsageLimitError` = runtime/system-prompt gate.
+> `403 FreeTierError` = header/session/tools gate. Do not "fix" a 429 by
+> changing the session id or the UA — that is the 403 gate.
+
 ## File map (who owns what)
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server, routing, `/__session` debug endpoint, direct-run guard |
+| `server.js` | HTTP server, routing, **`API_KEY` auth gate**, `/__session` debug endpoint, direct-run guard |
 | `src/routes.js` | `/v1/models`, `/v1/models/:id`, `/v1/chat/completions`, `/__session`, `/__models` |
 | `src/models.js` | Local model registry + `opencode-free/` id prefix handling |
+| `src/auth.js` | **Optional client authentication** (`API_KEY`): parses `Authorization: Bearer` / `x-api-key`, timing-safe compare, `isPublicPath` for the health routes |
 | `src/config.js` | **Fingerprint + model registry source of truth**: re-exports the fingerprint API from `src/fingerprint.js`, UA/tool fallbacks, mandatory tools, env overrides, **live model discovery (`GET /models` → filter ids containing `big-pickle` or `-free`) with TTL cache** |
 | `src/fingerprint.js` | **Pure-JS fingerprint generation**: opencode's `descending()`/`ascending()` id algorithm (`ses_`/`msg_`), session mode (per-request/sticky), header builder (UA + `x-opencode-session` + matching `x-opencode-session-id`), fingerprint state |
-| `src/conversions.js` | OpenAI↔upstream normalization; `buildRequestBody` forces `stream:true` + injects the 4 tools; SSE aggregation for non-stream |
-| `src/upstream.js` | **Request injection + relay**: builds fingerprint headers (from `config.getFingerprintHeaders`), POSTs upstream, aggregates SSE→JSON for non-stream |
+| `src/conversions.js` | OpenAI↔upstream normalization; `buildRequestBody` forces `stream:true` + injects the 4 tools; **`injectOpencodeSystemEnv`/`opencodeEnvBlock`** append OpenCode's `<env>` block (the 429 gate) inside `finalizeBody`; SSE aggregation for non-stream |
+| `src/upstream.js` | **Request injection + relay**: builds fingerprint headers (from `config.getFingerprintHeaders`), threads `systemEnv` into every upstream body (initial + follow-up turns), POSTs upstream, aggregates SSE→JSON for non-stream |
+| `src/ipinfo.js` | **Startup client-IP diagnostic**: fire-and-forget `GET https://ipinfo.io/json` at boot, prints the raw response (ip/city/region/country/loc/org/postal/timezone) + a one-line summary; never fatal, `IPINFO_DISABLED=1` disables |
 
-## Maintenance philosophy (read this before "fixing" a 403)
+## Maintenance philosophy (read this before "fixing" a 403 or a 429)
 
 The free-tier detection is server-side and the vendor **keeps tightening it**
-(multiple changes reported since 2026-09). When the upstream starts rejecting us
-with `403 FreeTierError` again, the fix is almost always localized to the
-**fingerprint**, not the proxy plumbing:
+(multiple changes reported since 2026-09). Identify the gate from the error
+first, then keep the change localized to the fingerprint:
 
-> **Only ever change `src/config.js` and `src/upstream.js`.**
-> This matches the strategy in the reference project `zen_relay.py` — keep the
-> OpenAI-compatible surface (routes / models / conversions *shape*) stable, and
-> change the fingerprint in one place.
+| Symptom | Gate | Where to change it |
+|---|---|---|
+| `403 FreeTierError` | client fingerprint (headers / session id / tools) | `src/fingerprint.js` (algorithm, UA, `MAX_COUNTER`), `src/config.js` (env overrides, `ZEN_FREE_TOOLS`) |
+| `429 FreeUsageLimitError` | runtime TLS hello **and** system-prompt `<env>` block | `Dockerfile`/runtime (must be Bun), `injectOpencodeSystemEnv` in `src/conversions.js`, plumbing in `src/upstream.js`/`src/routes.js` |
+| `400` `messages[N].tool_calls…` / `stream` rejected | body shape | `src/conversions.js` (`sanitizeWireMessages`, `finalizeBody`) |
+
+> **Never touch the OpenAI-compatible surface** (routes / models / response
+> shape) to fix a fingerprint gate. This matches the strategy in the reference
+> project `zen_relay.py` — keep the downstream contract stable and change the
+> fingerprint in one place.
 
 Concretely:
 - **Header/UA/session/tool fingerprint changed?** → the fingerprint is generated
@@ -118,26 +167,41 @@ this repo's `tests`) whenever a change is suspected, before editing code.
 ## Run / configure
 
 ```bash
-npm start            # http://127.0.0.1:8791/v1
-node server.js
+npm start            # = bun server.js, http://127.0.0.1:8791/v1
+bun server.js
+node server.js       # starts, but the free tier 429s Node's TLS hello — debug only
 ```
 
 | Env | Default | Notes |
 |---|---|---|
 | `PORT` | `8791` | listen port |
 | `HOST` | `127.0.0.1` | bind host |
-| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/zen/v1` | redirect relay (used by tests) |
+| `OPENCODE_BASE_OVERRIDE` | `https://opencode.ai/inference/openai/v1` | redirect relay (used by tests) |
 | `ZEN_SESSION_MODE` | `per-request` | `per-request` (fresh `ses_` each call) or `sticky` (reuse one) |
 | `ZEN_SESSION_ROTATE_SECONDS` | `0` | when `sticky`, rotate session every N seconds |
 | `ZEN_MODELS_TTL_SECONDS` | `600` | model-list cache TTL in seconds (`0` = never expire) |
 | `ZEN_MODELS_TIMEOUT_MS` | `5000` | timeout for the upstream model-discovery fetch |
 | `OPENCODE_UA` | `opencode/latest/2.0.22/cli` | User-Agent advertised to the free-tier gate |
+| `OPENCODE_ENV_CWD` | `/` | Working directory advertised in the injected `<env>` block (`x-opencode-directory` from the caller wins) |
+| `OPENCODE_SYSTEM_FP` | _(unset)_ | `0` disables the `<env>` block injection (free tier then answers 429) |
+| `API_KEY` | `public` (Dockerfile) | client→relay credential; unset/empty disables auth. Enforced in `server.js` for everything except `/`, `/health`, `/v1`, `/v1/` (so `/v1/*` and `/__*` are gated) |
+| `IPINFO_DISABLED` | _(unset)_ | `1` skips the startup client-IP lookup |
+| `IPINFO_URL` | `https://ipinfo.io/json` | endpoint queried at startup |
+| `IPINFO_TIMEOUT_MS` | `5000` | timeout for the startup IP lookup |
 
 Local debug (never forwarded upstream):
 ```bash
 curl http://127.0.0.1:8791/__session
 curl http://127.0.0.1:8791/__models      # ?refresh=1 forces a re-fetch
 ```
+
+At startup the relay also prints the host's egress IP info (`src/ipinfo.js`):
+```
+[opencode-free-provider] client ip info (https://ipinfo.io/json): {"ip":"111.10.182.15","city":"Chongqing",...}
+[opencode-free-provider] client ip summary: ip=111.10.182.15 — Chongqing, Chongqing, CN | AS9808 China Mobile… | Asia/Shanghai
+```
+It is fire-and-forget (a blocked network only logs a warning) and can be
+disabled with `IPINFO_DISABLED=1`.
 
 ## Connect an agent
 
@@ -147,8 +211,12 @@ apiKey:  public
 model:   opencode-free/big-pickle
 ```
 
-The proxy does NOT receive or honor any working-directory field (no `x-opencode-cwd`
-header, no body `cwd`/`workdir`). It never runs tools, so it never has a server-side
+The proxy never *executes* anything and never reads the filesystem. It does read
+the caller's `x-opencode-directory` header (when present) for ONE purpose: to
+advertise a truthful `Working directory:` inside the injected `<env>` block that
+the 429 gate demands. It is metadata in the prompt, not a server-side cwd: no
+tool ever runs inside the proxy, and the agent remains authoritative over where
+commands execute. Without the header the block falls back to `OPENCODE_ENV_CWD`. It never runs tools, so it never has a server-side
 cwd to get wrong. Any tool the model requests that the agent lacks (e.g. `glob` when
 the agent registers `bash`/`grep`/`read` but not `glob`) is **translated** by the
 proxy into an agent-supported tool — `glob` becomes a `bash` globstar loop — which
@@ -161,7 +229,7 @@ no translation at all.
 ## Test / validate
 
 ```bash
-npm test                 # 50 unit tests against a MOCK upstream (no network)
+npm test                 # 66 unit tests against a MOCK upstream (no network)
 ```
 
 Live end-to-end against the real free tier (expect 200 + SSE / aggregated JSON):

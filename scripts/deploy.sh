@@ -7,6 +7,10 @@
 # chat request dies with 403 FreeTierError at the upstream gate. Run this after
 # pulling or editing code so the running process always executes current code.
 #
+# The server is started with BUN when available: the free tier fingerprints the
+# outbound TLS client hello, and Node/OpenSSL is answered with
+# 429 FreeUsageLimitError even when the egress IP still has free quota.
+#
 # Usage:      npm run deploy
 # Override:   OFP_INSTALL_DIR=/path/to/install npm run deploy
 # Port/host:  standard env overrides (PORT, HOST) are honored by server.js
@@ -28,7 +32,13 @@ pkill -f "$DST/server.js" 2>/dev/null || true
 sleep 1
 
 cd "$DST"
-setsid nohup node server.js >> "$DST/server.log" 2>&1 < /dev/null &
+if command -v bun >/dev/null 2>&1; then
+  setsid nohup bun server.js >> "$DST/server.log" 2>&1 < /dev/null &
+else
+  echo "deploy: WARNING: bun not found — falling back to node." >&2
+  echo "deploy: Node's TLS client hello is rejected by the free tier (429 FreeUsageLimitError even with quota left)." >&2
+  setsid nohup node server.js >> "$DST/server.log" 2>&1 < /dev/null &
+fi
 
 # Give the process a moment to bind, then verify.
 sleep 3

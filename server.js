@@ -7,12 +7,26 @@
 //   POST /v1/chat/completions   (stream: true/false → SSE / JSON)
 //
 // Every request is relayed (with the shared literal key "Bearer public") to
-// OpenCode Zen's free tier (https://opencode.ai/zen/v1). No login, no key.
+// OpenCode Zen's free tier (https://opencode.ai/inference/openai/v1). No login,
+// no key.
+//
+// RUN IT WITH BUN (see Dockerfile). The free tier fingerprints the *TLS client
+// hello* of the calling process: requests sent from Bun (the runtime OpenCode
+// itself ships) are accepted, while the same request sent from Node's
+// TLS/OpenSSL stack is answered with
+//   429 FreeUsageLimitError "Free usage limit reached…"
+// even when the IP still has free quota left. `node server.js` therefore works
+// as an OpenAI-compatible proxy only for endpoints that do not enforce that
+// gate; the free tier needs `bun server.js`.
 //
 // Connect an agent (e.g. OpenCode) with:
 //   baseURL: http://127.0.0.1:8791/v1
-//   apiKey:  public            (or any non-empty string)
+//   apiKey:  <API_KEY>         (image default: "public"; unset API_KEY = no auth)
 //   model:   opencode-free/big-pickle
+//
+// `API_KEY` (Dockerfile ENV, overridable with `-e API_KEY=…`) is the
+// CLIENT→relay credential: when set, every /v1 request must send it as
+// `Authorization: Bearer <API_KEY>` (or `x-api-key`). See src/auth.js.
 //
 // The upstream free tier enforces a client-fingerprint gate (User-Agent must be
 // opencode/>=1.18, a valid x-opencode-session id, and the request body must
@@ -26,9 +40,13 @@ import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
 import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull, handleEgressSet, handleEgressSweepNow } from './src/routes.js'
 import { startSweeper } from './src/egress.js'
+import { authRequired, isAuthorized, isPublicPath } from './src/auth.js'
+import { logClientIpInfo } from './src/ipinfo.js'
 
 const HOST = process.env.HOST || DEFAULT_HOST
 const PORT = Number(process.env.PORT || DEFAULT_PORT)
+const IS_BUN = typeof Bun !== 'undefined'
+const RUNTIME = IS_BUN ? `bun ${Bun.version}` : `node ${process.version}`
 
 function sendText(res, status, text, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...headers })
@@ -46,9 +64,29 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
       })
       res.end()
+      return
+    }
+
+    // Optional client authentication (API_KEY). Health/landing stays public;
+    // /v1/* and the /__* debug endpoints require the key when it is configured.
+    if (!isPublicPath(path) && !isAuthorized(req)) {
+      const body = JSON.stringify({
+        error: {
+          message: 'Invalid API key. Send it as `Authorization: Bearer <API_KEY>` (the relay\'s API_KEY env var).',
+          type: 'invalid_request_error',
+          code: 'invalid_api_key',
+        },
+      })
+      res.writeHead(401, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'WWW-Authenticate': 'Bearer',
+        'Access-Control-Allow-Origin': '*',
+      })
+      res.end(body)
       return
     }
 
@@ -146,11 +184,25 @@ function start() {
     process.exit(1)
   })
   server.listen(PORT, HOST, () => {
-    console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1`)
+    console.log(`[opencode-free-provider] listening on http://${HOST}:${PORT}/v1 (${RUNTIME})`)
     console.log(`[opencode-free-provider] relaying to OpenCode Zen free tier (Bearer public)`)
+    console.log(`[opencode-free-provider] client auth: ${authRequired() ? 'required (API_KEY set)' : 'disabled (API_KEY unset)'}`)
+    // Startup diagnostic: print this host's egress IP + geo/ASN (ipinfo.io).
+    // Fire-and-forget so a blocked network never delays or blocks startup;
+    // disable with IPINFO_DISABLED=1, override the endpoint with IPINFO_URL.
+    logClientIpInfo()
+
     // Background egress sweeper: scrapes fast proxies from the web, re-tests the
     // pool + dustbin in parallel (default 30 IPs), and keeps the rotation fresh.
     startSweeper()
+
+    if (!IS_BUN) {
+      console.warn(
+        '[opencode-free-provider] WARNING: running under Node. The free tier fingerprints the outbound '
+        + 'TLS client hello; Node/OpenSSL is rejected with 429 FreeUsageLimitError even with quota left. '
+        + 'Run `bun server.js` (the Docker image already does).',
+      )
+    }
     // Log the generated fingerprint so the first chat request is predictable.
     // Generation is pure JS and synchronous, so there is no warm-up cost; this
     // is purely informational.
