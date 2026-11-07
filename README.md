@@ -13,18 +13,19 @@ Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (o
 > client hello*; Node/OpenSSL is answered with `429 FreeUsageLimitError` even on
 > an IP that still has free quota. See [Two gates, not one](#two-gates-not-one).
 
-The free tier quota is **per-IP**, so the proxy also runs an **egress pool**:
-fast HTTP proxies scraped from the web are kept in a verified pool, and when the
-direct connection (or the current proxy) hits `429 FreeUsageLimitError`, requests
-rotate to the next usable egress IP automatically.
+The relay reacts to upstream 429s two different ways, because there are two
+different 429s on this tier:
 
-Identity rotates together with the IP: every egress rotation also re-mints the
-opencode fingerprint — a fresh `x-opencode-session` id (and, per attempt, a fresh
-`x-opencode-request`) — so a new IP never reuses a session the old IP already
-carried (`rotateSession()`, src/fingerprint.js). This reuses a session on the
-**client-gate** 429 (FreeUsageLimitError-family) rather than rotating: that one
-deterministically follows the client until its reset time, so the relay fails
-fast instead of burning the pool on IP moves.
+1. **Client-gate 429** (`FreeUsageLimitError` family): it follows the CLIENT
+   (Bun TLS + `<env>` block), not the IP — see [Two gates, not one](#two-gates-not-one).
+   Rotating IPs cannot fix it, so the relay opens a **fail-fast cooldown** until
+   the reset time instead of burning the egress pool.
+2. **Recoverable 429s** (plain rate limit / possible per-IP budget, any body
+   outside that family): the relay rotates the egress IP and — at the same
+   time — **re-mints the opencode identity**: a fresh `x-opencode-session` (and,
+   per attempt, a fresh `x-opencode-request`) so the new IP never reuses a
+   session the previous one already carried (`rotateSession()` in
+   `src/fingerprint.js`).
 
 ## Why a proxy is needed
 
@@ -102,9 +103,10 @@ replaces instructions.
 ## Client auth (`API_KEY`)
 
 The relay binds a public port, so by default **anyone** who knows the URL can
-spend the free-tier quota of that egress IP. `API_KEY` closes that hole: it is
-the *client→relay* credential (separate from the *relay→upstream* one, which is
-still `Bearer public` / `OPENCODE_ZEN_API_KEY`).
+hammer it — unauthenticated traffic is what opens the fail-fast cooldown and
+boots IPs into the dustbin for everyone using the relay. `API_KEY` closes that
+hole: it is the *client→relay* credential (separate from the *relay→upstream*
+one, which is still `Bearer public` / `OPENCODE_ZEN_API_KEY`).
 
 ```bash
 docker run -d --name opencode-free-provider -p 48391:8791 \
@@ -266,12 +268,14 @@ when this flag is set, and emits a `CONNECT` tunnel to the proxy.)
 > `ProxyAgent` via `setGlobalDispatcher` in `src/upstream.js` and pass it as the
 > `dispatcher` on each `fetch`.
 
-## Egress IP pool (per-IP quota rotation)
+## Egress IP pool (429 rotation)
 
-The free tier enforces a **per-IP daily usage limit**. When your outbound IP
-exhausts it, every request returns `429 FreeUsageLimitError` with a
-`retry-after` until the UTC midnight reset. `src/egress.js` automates around
-this:
+Upstream 429s are classified by body: the `FreeUsageLimitError` family is the
+client gate (fail-fast cooldown, see above) and is **not** treated as an IP
+fault — the ablation in [Two gates, not one](#two-gates-not-one) proved that the
+same error comes from any IP. Any other 429 (retryable rate limit — possibly a
+per-IP/egress budget) is treated as "this egress IP is currently unusable" and
+the relay rotates. `src/egress.js` automates that IP half:
 
 - **Web-scraped pool.** On startup and every sweep the proxy scrapes three
   public sources and keeps only *fast, reachability-capable* HTTP proxies:
@@ -284,8 +288,8 @@ this:
   `src/fingerprint.js` headers — a forged session id yields `403` and would
   falsely poison the pool). Outcomes:
   - `200` → `status: ok`, ranked by time-to-first-byte;
-  - `429` → **dustbinned until its `retry-after`** (the proxy's own egress IP
-    is quota-exhausted; it returns automatically at the reset);
+  - `429` → **dustbinned until its `retry-after`** (this egress IP is marked
+    unusable for now; it returns automatically at the reset time);
   - transport failure / other 4xx → **dustbinned dead** and re-tested after
     30 minutes.
 - **Background sweep.** Every 3 minutes (20 s in busy mode when no usable IP
@@ -293,11 +297,13 @@ this:
   stale `ok` entries (re-verified every 10 min so the best-IP ranking stays
   honest), and due dustbin entries.
 - **Fast rotation at request time.** The relay routes each turn through the
-  best verified proxy (or direct when the pool is empty). On a 429 the
-  exhausted proxy is dustbinned and the next one is picked immediately; when
-  the direct connection 429s the relay inline quick-probes up to 3 fresh
-  candidates so a working IP is found without waiting for the next sweep.
-  Successes/failures are fed back into the pool via `reportEgress`.
+  best verified proxy (or direct when the pool is empty). On a *recoverable*
+  429 the exhausted proxy is dustbinned and the next one is picked immediately;
+  when the direct connection gets one, the relay inline quick-probes up to 3
+  fresh candidates so a working IP is found without waiting for the next sweep.
+  A client-gate quota 429 is never rotated (see the section head). Identity
+  re-mints with every IP move. Successes/failures are fed back into the pool
+  via `reportEgress`.
 
 State lives in two JSON files next to `server.js` (gitignored, recreated on
 start): `egress-pool.json` (live entries) and `egress-dustbin.json`
