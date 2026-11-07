@@ -66,6 +66,10 @@ jobs:
       id: build
       run: |
         IMAGE="${{ github.event.inputs.arg_registry || 'ghcr.io' }}/${{ github.event.inputs.arg_user || github.actor }}/${{ github.event.inputs.arg_name || 'opencode-free-provider:latest' }}"
+        # ghcr.io (and every registry) requires the image path to be lowercase;
+        # github.actor can be mixed-case (e.g. Suydev) → normalize before using
+        # or buildx rejects with "repository name must be lowercase".
+        IMAGE=$(printf '%s' "$IMAGE" | tr 'A-Z' 'a-z')
         PLATFORMS="${{ github.event.inputs.arg_platforms || 'linux/amd64,linux/arm64' }}"
         echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
         echo "PLATFORMS=$PLATFORMS" >> "$GITHUB_ENV"
