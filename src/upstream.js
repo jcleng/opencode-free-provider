@@ -1,14 +1,16 @@
+import { ProxyAgent, fetch as undiciFetch } from 'undici'
 // Apply the outbound connect-timeout tuning before any fetch is made.
 import './network.js'
 import {
   getOpencodeBase, OPENCODE_UA, LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
-  isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders,
+  isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders, rotateSession,
 } from './config.js'
 import {
   buildRequestBody, buildWireBody, parseSse,
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
   normalizeToolArguments, shapeCompletion,
 } from './conversions.js'
+import { pickEgress, reportEgress, ensureEgress, recordRequest, recordBytes } from './egress.js'
 
 function resolveApiKey() {
   return process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_G_API_KEY || LITERAL_KEY
@@ -281,8 +283,20 @@ export async function* relayChatCompletions(opts) {
     : opts.systemEnv
 
   const clientToolNames = callerToolNames(tools)
-  // Await the real opencode fingerprint once (cached/promised inside config.js).
-  const fpHeaders = await getFingerprintHeaders().catch(() => null)
+  // The opencode fingerprint identity used by every attempt in this turn. It
+  // starts fresh and is RE-MINTED at every egress rotation (see rotateIdentity
+  // below), so a rotated IP is always paired with a new ses_ session and a new
+  // x-opencode-request id.
+  let fpHeaders = await getFingerprintHeaders().catch(() => null)
+
+  // Re-mint the whole client identity after an egress rotation: rotate the
+  // session id (effective in 'sticky' mode; 'per-request' mints one per call
+  // anyway) and refresh the header set so the very next upstream attempt
+  // carries the new x-opencode-session + a fresh x-opencode-request id.
+  async function rotateIdentity() {
+    rotateSession()
+    fpHeaders = await getFingerprintHeaders().catch(() => null)
+  }
   const baseBody = buildRequestBody({
     model, messages, system, tools,
     maxTokens: maxTokens || DEFAULT_MAX_TOKENS,
@@ -299,7 +313,12 @@ export async function* relayChatCompletions(opts) {
   // (fetch failed / reset / timeout) and retryable HTTP statuses are thrown and
   // retried by the loop below. Nothing is emitted to the agent until a turn
   // fully succeeds, so retrying never duplicates already-delivered content.
-  async function performTurn() {
+  //
+  // `proxy` routes this turn through one egress IP from the pool (null =
+  // direct). `turnModel` is the model currently being tried from the fallback
+  // chain. A 429 FreeUsageLimitError is per-IP, so the retry loop dustbins the
+  // current egress and rotates to the next one.
+  async function performTurn(turnModel, proxy) {
     if (signal?.aborted) throw abortedError()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs || 60000)
@@ -307,13 +326,21 @@ export async function* relayChatCompletions(opts) {
     if (signal) signal.addEventListener('abort', onAbort)
     let response
     try {
-      const body = { ...baseBody, messages: wireMessages }
-      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+      const body = { ...baseBody, messages: wireMessages, model: turnModel }
+      const bodyBytes = Buffer.byteLength(JSON.stringify(body))
+      recordBytes(bodyBytes, 0)
+      const init = {
         method: 'POST',
         headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(body),
         signal: controller.signal,
-      })
+      }
+      if (proxy) init.dispatcher = new ProxyAgent({ uri: proxy, connectTimeout: 10000, headersTimeout: timeoutMs || 60000, bodyTimeout: 0 })
+      // Proxied attempts MUST use undici's own fetch: the installed undici
+      // ProxyAgent is not a valid dispatcher for Node's built-in global fetch
+      // (separate undici copy → UND_ERR_INVALID_ARG), which silently degraded
+      // every rotation to "direct or die". Direct attempts keep global fetch.
+      response = await (proxy ? undiciFetch : fetch)(`${getOpencodeBase()}/chat/completions`, init)
     } catch (err) {
       throw enrichTransportError(err, 'fetch', timeoutMs)
     } finally {
@@ -327,11 +354,12 @@ export async function* relayChatCompletions(opts) {
     }
 
     const ctype = response.headers.get('content-type') || ''
+    recordBytes(0, Number(response.headers.get('content-length') || 0))
     try {
       // Fully consume the upstream stream (this is where a mid-stream connection
       // drop surfaces) and translate fingerprint tool calls for the agent.
       if (ctype.includes('event-stream')) {
-        return await runTranslateLoop(response, { ...opts, systemEnv }, wireMessages, wireTools, clientToolNames, fpHeaders)
+        return await runTranslateLoop(response, { ...opts, systemEnv }, wireMessages, wireTools, clientToolNames, fpHeaders, proxy)
       }
       // Unexpected non-stream JSON response for a streaming request.
       const payload = await response.json().catch(() => null)
@@ -342,36 +370,83 @@ export async function* relayChatCompletions(opts) {
     }
   }
 
-  // Retry loop over the FULL turn. The free tier is flaky: connections get
-  // reset mid-stream and long turns can exceed the per-request timeout. We
-  // retry connection-level failures and 429/5xx with exponential backoff +
-  // jitter, enriching errors with the real cause (ECONNRESET, ETIMEDOUT, ...).
-  // Non-retryable 4xx and client aborts surface immediately.
-  const attempts = Math.max(1, MAX_REQUEST_ATTEMPTS)
+  // Retry loop over the FULL turn with FAST rotation (egress IPs only — the
+  // model is whatever the harness picked; we never swap it):
+  //   - 429 FreeUsageLimitError is per-IP:
+  //       through a proxy → dustbin it (until retry-after), rotate immediately;
+  //       on the direct connection → inline quick-probe up to 3 fresh pool
+  //         candidates (fast rotation), only fail fast when nothing remains.
+  //   - transport failures through a proxy → dustbin, rotate.
+  const directLimit = Math.max(1, MAX_REQUEST_ATTEMPTS)
+  const totalCap = 30 // bounded rotation budget: walk the pool, then fail fast on direct
+  let directAttempts = 0
   let lastError = null
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  for (let attempt = 0; attempt < totalCap; attempt++) {
+    const proxy = pickEgress() // null → direct connection
     let completion
     try {
-      completion = await performTurn()
+      completion = await performTurn(model, proxy)
     } catch (err) {
       if (signal?.aborted) throw abortedError()
       lastError = err
+      // The client-gate quota (FreeUsageLimitError-family) is deterministic
+      // until its reset time and follows the CLIENT, not the egress IP: fail
+      // fast — rotating IPs cannot fix this one.
       if (err.code === 'QUOTA_EXHAUSTED') {
-        // Deterministic until the reset time: record it, fail fast afterwards.
         markQuotaExhausted(err)
+        recordRequest({ viaProxy: !!proxy, outcome: 'quota' })
         throw err
       }
+
+      if (proxy) {
+        if (err.code === 'RATE_LIMITED') {
+          reportEgress(proxy, 'quota', { retryAfterSec: Math.ceil((err.retryAfterMs || 0) / 1000) })
+          recordRequest({ viaProxy: true, outcome: 'quota', rotated: true })
+          console.warn(`[opencode-free-provider] egress ${proxy} quota-exhausted (retry-after ${Math.ceil((err.retryAfterMs || 0) / 1000)}s); rotating IP`)
+          await rotateIdentity()
+          continue // fresh IP + fresh identity: no backoff
+        }
+        if (err.code === 'TRANSPORT' || isRetryableUpstreamError(err)) {
+          reportEgress(proxy, 'dead', { detail: err.message })
+          recordRequest({ viaProxy: true, outcome: 'dead' })
+          console.warn(`[opencode-free-provider] egress ${proxy} dead (${err.message}); rotating IP`)
+          await rotateIdentity()
+          continue // fresh IP + fresh identity
+        }
+        throw err // non-retryable 4xx through a proxy: surface immediately
+      }
+
+      // Direct-connection failure.
+      if (err.code === 'RATE_LIMITED') {
+        // FAST ROTATION: inline quick-probe up to 3 fresh candidates right now.
+        const fresh = await ensureEgress({ quick: 3 })
+        if (fresh) {
+          recordRequest({ viaProxy: false, outcome: 'quota', rotated: true })
+          console.warn(`[opencode-free-provider] direct egress quota-exhausted; fast-rotated to ${fresh}`)
+          await rotateIdentity()
+          continue // fresh IP + fresh identity: no backoff
+        }
+        recordRequest({ viaProxy: false, outcome: 'quota' })
+        const e = new Error('OpenCode Zen free quota exhausted on this IP and no verified egress proxy is available; the background sweep re-tests the pool and dustbin entries return after their retry-after')
+        e.code = 'RATE_LIMITED'
+        e.status = 429
+        if (err.retryAfterMs) e.retryAfterMs = err.retryAfterMs
+        throw e
+      }
+      directAttempts++
       if (!isRetryableUpstreamError(err)) throw err
-      if (attempt >= attempts - 1) break
-      // A transient 429 may still carry Retry-After; honor it (capped so a
-      // single client request cannot be held open for minutes).
+      if (directAttempts >= directLimit) break
+      // Honor Retry-After when the server sent one (capped so a single client
+      // request cannot be held open for minutes; the backoff is a floor).
       const retryAfterMs = Number(err.retryAfterMs) || 0
-      const waitMs = Math.max(backoffMs(attempt), Math.min(retryAfterMs, 10_000))
-      console.warn(`[opencode-free-provider] upstream attempt ${attempt + 1}/${attempts} failed: ${err.message}; retrying in ${waitMs}ms`)
+      const waitMs = Math.max(backoffMs(directAttempts - 1), Math.min(retryAfterMs, 10000))
+      console.warn(`[opencode-free-provider] upstream attempt ${directAttempts}/${directLimit} failed: ${err.message}; retrying in ${waitMs}ms`)
       await sleep(waitMs)
       continue
     }
 
+    if (proxy) reportEgress(proxy, 'ok')
+    recordRequest({ viaProxy: !!proxy, outcome: 'ok' })
     if (!stream) { yield completion; return }
     if (completion) yield* completionToChunks(completion)
     return
@@ -393,7 +468,7 @@ export async function* relayChatCompletions(opts) {
  * textual note and re-queries upstream (a pure relay — no shell/filesystem
  * execution) until the model yields either real agent work or a final answer.
  */
-async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames, fpHeaders) {
+async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, clientToolNames, fpHeaders, proxy) {
   const { model, maxTokens, temperature, topP, timeoutMs, systemEnv } = opts
   let wire = [...wireMessages]
   let response = firstResponse
@@ -447,13 +522,15 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
       const noteController = new AbortController()
       const noteTimer = setTimeout(() => noteController.abort(), timeoutMs || 60000)
       try {
-        response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+        const init = {
           method: 'POST', headers: fingerprintHeaders(fpHeaders),
           body: JSON.stringify(buildWireBody({
             model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP, systemEnv,
           })),
           signal: noteController.signal,
-        })
+        }
+        if (proxy) init.dispatcher = new ProxyAgent({ uri: proxy, connectTimeout: 10000, headersTimeout: timeoutMs || 60000, bodyTimeout: 0 })
+        response = await (proxy ? undiciFetch : fetch)(`${getOpencodeBase()}/chat/completions`, init)
         if (!response.ok) {
           const raw = await response.text().catch(() => '')
           throw upstreamHttpError(response.status, raw, response.headers.get('retry-after'))

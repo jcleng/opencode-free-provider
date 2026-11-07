@@ -13,6 +13,20 @@ Agent  ──►  http://127.0.0.1:8791/v1  ──►  OpenCode Zen free tier (o
 > client hello*; Node/OpenSSL is answered with `429 FreeUsageLimitError` even on
 > an IP that still has free quota. See [Two gates, not one](#two-gates-not-one).
 
+The relay reacts to upstream 429s two different ways, because there are two
+different 429s on this tier:
+
+1. **Client-gate 429** (`FreeUsageLimitError` family): it follows the CLIENT
+   (Bun TLS + `<env>` block), not the IP — see [Two gates, not one](#two-gates-not-one).
+   Rotating IPs cannot fix it, so the relay opens a **fail-fast cooldown** until
+   the reset time instead of burning the egress pool.
+2. **Recoverable 429s** (plain rate limit / possible per-IP budget, any body
+   outside that family): the relay rotates the egress IP and — at the same
+   time — **re-mints the opencode identity**: a fresh `x-opencode-session` (and,
+   per attempt, a fresh `x-opencode-request`) so the new IP never reuses a
+   session the previous one already carried (`rotateSession()` in
+   `src/fingerprint.js`).
+
 ## Why a proxy is needed
 
 `opencode.ai/inference/openai/v1` enforces a **client-fingerprint gate**: a bare request is
@@ -89,9 +103,10 @@ replaces instructions.
 ## Client auth (`API_KEY`)
 
 The relay binds a public port, so by default **anyone** who knows the URL can
-spend the free-tier quota of that egress IP. `API_KEY` closes that hole: it is
-the *client→relay* credential (separate from the *relay→upstream* one, which is
-still `Bearer public` / `OPENCODE_ZEN_API_KEY`).
+hammer it — unauthenticated traffic is what opens the fail-fast cooldown and
+boots IPs into the dustbin for everyone using the relay. `API_KEY` closes that
+hole: it is the *client→relay* credential (separate from the *relay→upstream*
+one, which is still `Bearer public` / `OPENCODE_ZEN_API_KEY`).
 
 ```bash
 docker run -d --name opencode-free-provider -p 48391:8791 \
@@ -253,6 +268,66 @@ when this flag is set, and emits a `CONNECT` tunnel to the proxy.)
 > `ProxyAgent` via `setGlobalDispatcher` in `src/upstream.js` and pass it as the
 > `dispatcher` on each `fetch`.
 
+## Egress IP pool (429 rotation)
+
+Upstream 429s are classified by body: the `FreeUsageLimitError` family is the
+client gate (fail-fast cooldown, see above) and is **not** treated as an IP
+fault — the ablation in [Two gates, not one](#two-gates-not-one) proved that the
+same error comes from any IP. Any other 429 (retryable rate limit — possibly a
+per-IP/egress budget) is treated as "this egress IP is currently unusable" and
+the relay rotates. `src/egress.js` automates that IP half:
+
+- **Web-scraped pool.** On startup and every sweep the proxy scrapes three
+  public sources and keeps only *fast, reachability-capable* HTTP proxies:
+  `geonode.com` (latency ≤ 500 ms, speed ≥ 800 KB/s, uptime ≥ 90 %), the
+  `monosans/proxy-list` GitHub list, and `free-proxy-list.net`
+  (**HTTPS/CONNECT-tunnel-capable** entries checked within the last 5 minutes
+  only).
+- **Verified before use.** Every candidate is probed with a real
+  `POST /chat/completions` through the proxy (using the genuine
+  `src/fingerprint.js` headers — a forged session id yields `403` and would
+  falsely poison the pool). Outcomes:
+  - `200` → `status: ok`, ranked by time-to-first-byte;
+  - `429` → **dustbinned until its `retry-after`** (this egress IP is marked
+    unusable for now; it returns automatically at the reset time);
+  - transport failure / other 4xx → **dustbinned dead** and re-tested after
+    30 minutes.
+- **Background sweep.** Every 3 minutes (20 s in busy mode when no usable IP
+  exists) up to 30 proxies are re-tested in parallel: untested candidates,
+  stale `ok` entries (re-verified every 10 min so the best-IP ranking stays
+  honest), and due dustbin entries.
+- **Fast rotation at request time.** The relay routes each turn through the
+  best verified proxy (or direct when the pool is empty). On a *recoverable*
+  429 the exhausted proxy is dustbinned and the next one is picked immediately;
+  when the direct connection gets one, the relay inline quick-probes up to 3
+  fresh candidates so a working IP is found without waiting for the next sweep.
+  A client-gate quota 429 is never rotated (see the section head). Identity
+  re-mints with every IP move. Successes/failures are fed back into the pool
+  via `reportEgress`.
+
+State lives in two JSON files next to `server.js` (gitignored, recreated on
+start): `egress-pool.json` (live entries) and `egress-dustbin.json`
+(dead/quota-burned entries with their retest times).
+
+Debug endpoint:
+
+```bash
+curl http://127.0.0.1:8791/__egress
+# → poolSize / ok / untested / dustbin(quota+dead) / lastSweep / best / top
+```
+
+Egress env overrides:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `EGRESS_SWEEP_CONCURRENCY` | `30` | Proxies re-tested in parallel per sweep |
+| `EGRESS_SWEEP_INTERVAL_MS` | `180000` | Base sweep interval (3 min); busy mode tightens to 20 s |
+| `EGRESS_PROBE_TIMEOUT_MS` | `15000` | Per-proxy probe timeout |
+| `EGRESS_DEAD_RETEST_MS` | `1800000` | Dustbin retest delay for dead proxies |
+| `EGRESS_OK_REVERIFY_MS` | `600000` | Re-verify `ok` proxies older than this |
+| `EGRESS_POOL_MAX` | `400` | Max pool entries |
+| `EGRESS_FAST_MAX_LATENCY_MS` / `EGRESS_FAST_MIN_SPEED` / `EGRESS_FAST_MIN_UPTIME` | `500` / `800` / `90` | geonode "fast only" filters |
+
 ## Connect an agent
 
 ```
@@ -300,6 +375,12 @@ PI Agent example:
 - `GET /health`, `/` — health text
 - `GET /__session` — local fingerprint/session status (includes `fingerprint.source`: `generated` = computed in pure JS)
 - `GET /__models` — local model-registry cache status (`?refresh=1` forces a re-fetch)
+- `GET /__egress` — egress pool / dustbin / last-sweep status (see "Egress IP pool")
+- `GET /__egress/dashboard` — **web control panel** (IP toggles, add proxies, retest)
+- `POST /__egress/import` — add proxies: body is plain text (one per line) or JSON `{ "proxies": [...] }`; each is verified immediately
+- `POST /__egress/toggle` — `{ "proxy" }` enable/disable one IP in rotation (persisted)
+- `POST /__egress/retest` — `{ "proxy" }` force a verification now
+- `POST /__egress/remove-user` — `{ "proxy" }` drop a user-added proxy
 
 ## Models
 

@@ -38,7 +38,8 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleEgressInfo, handleEgressDashboard, handleEgressImport, handleEgressToggle, handleEgressRetest, handleEgressRemoveUser, handleEgressFull, handleEgressSet, handleEgressSweepNow } from './src/routes.js'
+import { startSweeper } from './src/egress.js'
 import { authRequired, isAuthorized, isPublicPath } from './src/auth.js'
 import { logClientIpInfo } from './src/ipinfo.js'
 
@@ -120,6 +121,51 @@ const server = http.createServer(async (req, res) => {
       return await handleModelsInfo(req, res, url)
     }
 
+    // /__egress — local egress-pool status (pool / dustbin / last sweep).
+    if (method === 'GET' && path === '/__egress') {
+      return handleEgressInfo(req, res)
+    }
+
+    // /__egress/full — complete state for the dashboard.
+    if (method === 'GET' && path === '/__egress/full') {
+      return handleEgressFull(req, res)
+    }
+
+    // /__egress/dashboard — web control panel (IP toggles, add/import, retest).
+    if (method === 'GET' && path === '/__egress/dashboard') {
+      return handleEgressDashboard(req, res)
+    }
+
+    // /__egress/import — add proxies (paste body or {proxies:[...]}).
+    if (method === 'POST' && path === '/__egress/import') {
+      return await handleEgressImport(req, res)
+    }
+
+    // /__egress/toggle — { proxy } enable/disable rotation for one IP.
+    if (method === 'POST' && path === '/__egress/toggle') {
+      return await handleEgressToggle(req, res)
+    }
+
+    // /__egress/retest — { proxy } force a verification now.
+    if (method === 'POST' && path === '/__egress/retest') {
+      return await handleEgressRetest(req, res)
+    }
+
+    // /__egress/remove-user — { proxy } drop a user-added proxy.
+    if (method === 'POST' && path === '/__egress/remove-user') {
+      return await handleEgressRemoveUser(req, res)
+    }
+
+    // /__egress/set — { on } master switch (off = force direct connection).
+    if (method === 'POST' && path === '/__egress/set') {
+      return await handleEgressSet(req, res)
+    }
+
+    // /__egress/sweep-now — force a sweep immediately (background timer also runs).
+    if (method === 'POST' && path === '/__egress/sweep-now') {
+      return await handleEgressSweepNow(req, res)
+    }
+
     return sendText(res, 404, 'Not Found', { 'Access-Control-Allow-Origin': '*' })
   } catch (err) {
     console.error(`[opencode-free-provider] unhandled request error: ${err && err.stack || err}`)
@@ -145,6 +191,10 @@ function start() {
     // Fire-and-forget so a blocked network never delays or blocks startup;
     // disable with IPINFO_DISABLED=1, override the endpoint with IPINFO_URL.
     logClientIpInfo()
+
+    // Background egress sweeper: scrapes fast proxies from the web, re-tests the
+    // pool + dustbin in parallel (default 30 IPs), and keeps the rotation fresh.
+    startSweeper()
 
     if (!IS_BUN) {
       console.warn(
