@@ -173,8 +173,8 @@ export function anthropicMessagesToOpenAI(messages) {
           content,
         }
       })
-      if (text) out.push({ role, content: text })
       out.push(...toolResults)
+      if (text) out.push({ role, content: text })
     }
   }
   return out
