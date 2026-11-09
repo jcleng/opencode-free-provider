@@ -4,6 +4,7 @@ import {
   getOpencodeBase, OPENCODE_UA, LITERAL_KEY, DEFAULT_MAX_TOKENS, MAX_REQUEST_ATTEMPTS,
   isFingerprintTool, getFingerprintHeaders, peekFingerprintHeaders,
 } from './config.js'
+import { fetchWithProxy, rotateProxy } from './proxy-pool.js'
 import {
   buildRequestBody, buildWireBody, parseSse,
   callerToolNames, translateFingerprintCall, encodeTranslatedId,
@@ -308,7 +309,7 @@ export async function* relayChatCompletions(opts) {
     let response
     try {
       const body = { ...baseBody, messages: wireMessages }
-      response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+      response = await fetchWithProxy(`${getOpencodeBase()}/chat/completions`, {
         method: 'POST',
         headers: fingerprintHeaders(fpHeaders),
         body: JSON.stringify(body),
@@ -357,6 +358,12 @@ export async function* relayChatCompletions(opts) {
       if (signal?.aborted) throw abortedError()
       lastError = err
       if (err.code === 'QUOTA_EXHAUSTED') {
+        const rotated = rotateProxy('free usage limit')
+        if (rotated && attempt < attempts - 1) {
+          console.warn(`[opencode-free-provider] free usage hit; retrying on next proxy`)
+          await sleep(200)
+          continue
+        }
         // Deterministic until the reset time: record it, fail fast afterwards.
         markQuotaExhausted(err)
         throw err
@@ -447,7 +454,7 @@ async function runTranslateLoop(firstResponse, opts, wireMessages, wireTools, cl
       const noteController = new AbortController()
       const noteTimer = setTimeout(() => noteController.abort(), timeoutMs || 60000)
       try {
-        response = await fetch(`${getOpencodeBase()}/chat/completions`, {
+        response = await fetchWithProxy(`${getOpencodeBase()}/chat/completions`, {
           method: 'POST', headers: fingerprintHeaders(fpHeaders),
           body: JSON.stringify(buildWireBody({
             model, wireMessages: wire, wireTools, maxTokens: maxTokens || DEFAULT_MAX_TOKENS, temperature, topP, systemEnv,

@@ -61,7 +61,7 @@ export const DEFAULT_PORT = 8791
 export const DEFAULT_HOST = '127.0.0.1'
 export const DEFAULT_MAX_TOKENS = 128000
 export const DEFAULT_CONTEXT_WINDOW = 200000
-export const MAX_REQUEST_ATTEMPTS = 3
+export const MAX_REQUEST_ATTEMPTS = Number(process.env.MAX_REQUEST_ATTEMPTS) || 3
 
 // ---------------------------------------------------------------------------
 // Mandatory tool "fingerprint"
