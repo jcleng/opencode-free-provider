@@ -121,6 +121,211 @@ function requestSystemEnv(req) {
   }
 }
 
+export function anthropicSystemToString(system) {
+  if (typeof system === 'string') return system
+  if (!Array.isArray(system)) return undefined
+  const text = system.map((block) => block?.type === 'text' ? String(block.text || '') : '').join('\n')
+  return text || undefined
+}
+
+export function anthropicToolsToOpenAI(tools) {
+  return (Array.isArray(tools) ? tools : []).map((tool) => ({
+    type: 'function',
+    function: {
+      name: String(tool?.name || ''),
+      description: String(tool?.description || ''),
+      parameters: tool?.input_schema || { type: 'object', properties: {} },
+    },
+  })).filter((tool) => tool.function.name)
+}
+
+export function anthropicMessagesToOpenAI(messages) {
+  const out = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const role = message?.role === 'assistant' ? 'assistant' : 'user'
+    const blocks = Array.isArray(message?.content)
+      ? message.content
+      : [{ type: 'text', text: message?.content || '' }]
+    if (role === 'assistant') {
+      const text = blocks.filter((b) => b?.type === 'text').map((b) => b.text || '').join('')
+      const toolCalls = blocks.filter((b) => b?.type === 'tool_use').map((b) => ({
+        id: String(b.id || ''),
+        type: 'function',
+        function: {
+          name: String(b.name || ''),
+          arguments: JSON.stringify(b.input || {}),
+        },
+      }))
+      const item = { role, content: text }
+      if (toolCalls.length) item.tool_calls = toolCalls
+      out.push(item)
+    } else {
+      const text = blocks.filter((b) => b?.type === 'text').map((b) => b.text || '').join('')
+      const toolResults = blocks.filter((b) => b?.type === 'tool_result').map((b) => {
+        let content = ''
+        if (typeof b.content === 'string') content = b.content
+        else if (Array.isArray(b.content)) {
+          content = b.content.map((part) => part?.type === 'text' ? part.text || '' : JSON.stringify(part)).join('\n')
+        } else if (b.content != null) content = JSON.stringify(b.content)
+        return {
+          role: 'tool',
+          tool_call_id: String(b.tool_use_id || ''),
+          content,
+        }
+      })
+      out.push(...toolResults)
+      if (text) out.push({ role, content: text })
+    }
+  }
+  return out
+}
+
+export function openAIToAnthropicMessage(completion, requestedModel) {
+  const choice = completion?.choices?.[0] || {}
+  const message = choice.message || {}
+  const usage = completion?.usage || {}
+  const content = []
+  if (typeof message.content === 'string' && message.content) {
+    content.push({ type: 'text', text: message.content })
+  }
+  for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+    let input = {}
+    try { input = JSON.parse(call.function?.arguments || '{}') } catch { input = {} }
+    content.push({
+      type: 'tool_use',
+      id: String(call.id || ''),
+      name: String(call.function?.name || ''),
+      input,
+    })
+  }
+  if (!content.length) content.push({ type: 'text', text: '' })
+  const stopReason = choice.finish_reason === 'length'
+    ? 'max_tokens'
+    : content.some((block) => block.type === 'tool_use')
+      ? 'tool_use'
+      : 'end_turn'
+  return {
+    id: 'msg_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    type: 'message',
+    role: 'assistant',
+    model: requestedModel || completion?.model || 'unknown',
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: Number(usage.prompt_tokens || 0),
+      output_tokens: Number(usage.completion_tokens || 0),
+    },
+  }
+}
+
+function sendAnthropicSse(res, message) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no',
+  })
+
+  res.write(`event: message_start\ndata: ${JSON.stringify({
+    type: 'message_start',
+    message: { ...message, content: [] },
+  })}\n\n`)
+
+  message.content.forEach((block, index) => {
+    const blockStart = block.type === 'tool_use'
+      ? { type: 'tool_use', id: block.id, name: block.name, input: {} }
+      : { type: 'text', text: '' }
+    res.write(`event: content_block_start\ndata: ${JSON.stringify({
+      type: 'content_block_start',
+      index,
+      content_block: blockStart,
+    })}\n\n`)
+
+    const delta = block.type === 'tool_use'
+      ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input || {}) }
+      : { type: 'text_delta', text: block.text || '' }
+    res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+      type: 'content_block_delta',
+      index,
+      delta,
+    })}\n\n`)
+
+    res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+      type: 'content_block_stop',
+      index,
+    })}\n\n`)
+  })
+
+  res.write(`event: message_delta\ndata: ${JSON.stringify({
+    type: 'message_delta',
+    delta: { stop_reason: message.stop_reason, stop_sequence: null },
+    usage: { output_tokens: message.usage?.output_tokens || 0 },
+  })}\n\n`)
+  res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+  res.end()
+}
+
+export async function handleAnthropicMessages(req, res) {
+  let raw
+  try {
+    raw = await readBody(req)
+  } catch {
+    return sendJson(res, 413, { type: 'error', error: { type: 'invalid_request_error', message: 'Payload too large' } })
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw.toString('utf8') || '{}')
+  } catch {
+    return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON' } })
+  }
+
+  await ensureModels()
+  const requested = typeof parsed.model === 'string' && parsed.model ? parsed.model : ''
+  const fallbackModel = process.env.OPENCODE_ANTHROPIC_MODEL || 'glm-5.3-flash-free'
+  const { model } = splitModelId(isValidModel(requested) ? requested : fallbackModel)
+  const system = anthropicSystemToString(parsed.system)
+  const messages = anthropicMessagesToOpenAI(parsed.messages)
+  const systemEnv = requestSystemEnv(req)
+  const clientAbort = new AbortController()
+  const onClose = () => clientAbort.abort()
+  res.on('close', onClose)
+
+  try {
+    let completion = null
+    for await (const item of relayChatCompletions({
+      model,
+      messages,
+      system,
+      tools: anthropicToolsToOpenAI(parsed.tools),
+      maxTokens: parsed.max_tokens,
+      temperature: parsed.temperature,
+      stream: false,
+      topP: parsed.top_p,
+      signal: clientAbort.signal,
+      timeoutMs: 120000,
+      systemEnv,
+    })) {
+      completion = item
+    }
+    const anthropicMessage = openAIToAnthropicMessage(completion, requested)
+    if (parsed.stream === true) return sendAnthropicSse(res, anthropicMessage)
+    return sendJson(res, 200, anthropicMessage)
+  } catch (err) {
+    if (clientAbort.signal.aborted && !res.headersSent) {
+      res.end()
+      return
+    }
+    const message = err.code === 'QUOTA_EXHAUSTED'
+      ? quotaMessage(err)
+      : `Upstream error: ${err.message}`
+    return sendJson(res, err.status || 502, { type: 'error', error: { type: 'upstream_error', message } })
+  } finally {
+    res.off('close', onClose)
+  }
+}
+
 export async function handleChatCompletions(req, res) {
   let raw
   try {

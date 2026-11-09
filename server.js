@@ -38,7 +38,7 @@ import http from 'node:http'
 import { DEFAULT_HOST, DEFAULT_PORT, PROVIDER } from './src/config.js'
 import { fingerprintState } from './src/fingerprint.js'
 import { getFingerprintHeaders } from './src/config.js'
-import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo } from './src/routes.js'
+import { handleModels, handleModel, handleChatCompletions, handleSessionInfo, handleModelsInfo, handleAnthropicMessages } from './src/routes.js'
 import { authRequired, isAuthorized, isPublicPath } from './src/auth.js'
 import { logClientIpInfo } from './src/ipinfo.js'
 
@@ -108,6 +108,11 @@ const server = http.createServer(async (req, res) => {
     // /v1/chat/completions
     if (method === 'POST' && path === '/v1/chat/completions') {
       return await handleChatCompletions(req, res)
+    }
+
+    // Anthropic-compatible messages endpoint (used by Claude Code and other Anthropic clients)
+    if (method === 'POST' && path === '/v1/messages') {
+      return await handleAnthropicMessages(req, res)
     }
 
     // /__session — local debug endpoint (never forwarded upstream).
